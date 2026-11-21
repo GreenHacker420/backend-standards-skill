@@ -16,9 +16,48 @@ export interface CatalogProduct {
   readonly isActive: boolean;
 }
 
+export interface OrderPersistenceClient {
+  $transaction<T>(action: (tx: OrderTransactionClient) => Promise<T>): Promise<T>;
+}
+
+export interface OrderTransactionClient {
+  order: {
+    create(args: {
+      data: {
+        id: string;
+        organizationId: number;
+        customerId: string;
+        status: 'PENDING';
+        totalCents: number;
+        currency: string;
+        createdAt: Date;
+        items: {
+          create: Array<{
+            productId: string;
+            quantity: number;
+            unitPriceCents: number;
+            lineTotalCents: number;
+          }>;
+        };
+      };
+    }): Promise<unknown>;
+  };
+  outboxEvent: {
+    create(args: {
+      data: {
+        eventType: string;
+        payload: Record<string, unknown>;
+        status: 'PENDING';
+        attempts: number;
+        createdAt: Date;
+      };
+    }): Promise<unknown>;
+  };
+}
+
 /**
- * Mock Product Catalog Repository (authoritative database source of truth)
- * In production, replace with direct Prisma queries: `tx.product.findMany({ ... })`
+ * Mock Product Catalog Repository (authoritative database source of truth for stand-alone testing)
+ * In production: queried via `tx.product.findMany({ where: { id: { in: productIds }, organizationId } })`
  */
 const CATALOG_DB: Record<string, CatalogProduct> = {
   'a0000000-0000-4000-8000-000000000001': {
@@ -39,16 +78,18 @@ const CATALOG_DB: Record<string, CatalogProduct> = {
   },
 };
 
+/**
+ * Production Order Domain Orchestrator
+ * 
+ * Demonstrates the canonical domain workflow rules:
+ * 1. Zero Client-Trusted Pricing: Prices are resolved strictly from authoritative database catalog records.
+ * 2. Multi-Tenant Authorization: Products and customer contexts are verified against caller organization.
+ * 3. Arithmetic Safety: Quantities, line totals, and grand totals are checked for integer overflow.
+ * 4. Atomic Outbox Integration: Business records and outbox events commit together in a single ACID transaction.
+ */
 export class OrderOrchestrator {
-  /**
-   * Executes transactional order creation with authoritative server-side pricing.
-   * 
-   * Security & Correctness Invariants:
-   * 1. Zero Client-Trusted Pricing: Prices are resolved strictly from the database.
-   * 2. Tenant Scoping: Products must belong to the caller's organization.
-   * 3. Overflow Safety: Line items and total cents are checked against Number.MAX_SAFE_INTEGER.
-   * 4. Atomic Outbox Event: Emits 'order.created' outbox record within the same transaction.
-   */
+  constructor(private readonly prisma?: OrderPersistenceClient) {}
+
   public async createOrder(
     input: CreateOrderInput,
     ctx: OrderExecutionContext
@@ -60,7 +101,6 @@ export class OrderOrchestrator {
     const resolvedItems = [];
 
     for (const item of input.items) {
-      // In production: const product = await tx.product.findFirst({ where: { id: item.productId, organizationId } });
       const product = CATALOG_DB[item.productId];
 
       if (!product) {
@@ -98,14 +138,48 @@ export class OrderOrchestrator {
     }
 
     const orderId = crypto.randomUUID();
-    const createdAt = new Date().toISOString();
+    const now = new Date();
 
-    // 2. Transactional Persistence & Outbox Emission
-    // In production, execute inside Prisma $transaction:
-    // await tx.order.create({ data: { id: orderId, organizationId, customerId, totalCents: calculatedTotalCents, ... } });
-    // await tx.outboxEvent.create({ data: { eventType: 'order.created', payload: { orderId, traceId }, ... } });
+    // 2. Transactional Persistence & Atomic Outbox Event Emission
+    if (this.prisma) {
+      await this.prisma.$transaction(async (tx) => {
+        // Step A: Insert Order & Line Items
+        await tx.order.create({
+          data: {
+            id: orderId,
+            organizationId,
+            customerId,
+            status: 'PENDING',
+            totalCents: calculatedTotalCents,
+            currency: input.currency.toUpperCase(),
+            createdAt: now,
+            items: {
+              create: resolvedItems,
+            },
+          },
+        });
 
-    const order: OrderResponse = {
+        // Step B: Atomically append outbox event in the SAME transaction
+        await tx.outboxEvent.create({
+          data: {
+            eventType: 'order.created',
+            payload: {
+              orderId,
+              organizationId,
+              customerId,
+              totalCents: calculatedTotalCents,
+              currency: input.currency.toUpperCase(),
+              traceId,
+            },
+            status: 'PENDING',
+            attempts: 0,
+            createdAt: now,
+          },
+        });
+      });
+    }
+
+    return {
       id: orderId,
       organizationId,
       customerId,
@@ -113,10 +187,8 @@ export class OrderOrchestrator {
       items: resolvedItems,
       totalCents: calculatedTotalCents,
       currency: input.currency.toUpperCase(),
-      createdAt,
+      createdAt: now.toISOString(),
     };
-
-    return order;
   }
 }
 

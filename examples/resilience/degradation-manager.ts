@@ -1,4 +1,4 @@
-import { monitorEventLoopDelay } from 'perf_hooks';
+import { monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks';
 
 export interface LoggerInterface {
     warn(message: string, ...meta: unknown[]): void;
@@ -23,27 +23,66 @@ export enum ServiceTier {
 export interface DegradationOptions {
     readonly checkIntervalMs?: number;
     readonly recoveryHysteresisCycles?: number; // Consecutive healthy checks needed to step down (default: 3)
+    readonly autoStart?: boolean;               // Whether to start background health polling automatically (default: true)
     readonly logger?: LoggerInterface;
 }
 
 export class DegradationManager {
     private currentLevel: DegradationLevel = DegradationLevel.NORMAL;
     private consecutiveHealthyChecks = 0;
+    private readonly checkIntervalMs: number;
     private readonly recoveryHysteresisCycles: number;
     private readonly logger?: LoggerInterface;
-    private histogram = monitorEventLoopDelay({ resolution: 20 });
+    private histogram: IntervalHistogram;
+    private timer: NodeJS.Timeout | null = null;
+    private isRunning = false;
 
     constructor(options: DegradationOptions = {}) {
         const {
             checkIntervalMs = 5000,
             recoveryHysteresisCycles = 3,
+            autoStart = true,
             logger,
         } = options;
 
+        if (!Number.isInteger(checkIntervalMs) || checkIntervalMs < 100) {
+            throw new RangeError('[DegradationManager] checkIntervalMs must be an integer >= 100ms.');
+        }
+        if (!Number.isInteger(recoveryHysteresisCycles) || recoveryHysteresisCycles < 1) {
+            throw new RangeError('[DegradationManager] recoveryHysteresisCycles must be an integer >= 1.');
+        }
+
+        this.checkIntervalMs = checkIntervalMs;
         this.recoveryHysteresisCycles = recoveryHysteresisCycles;
         this.logger = logger;
+        this.histogram = monitorEventLoopDelay({ resolution: 20 });
+
+        if (autoStart) {
+            this.start();
+        }
+    }
+
+    public start(): void {
+        if (this.isRunning) return;
+        this.isRunning = true;
         this.histogram.enable();
-        setInterval(() => this.evaluateHealth(), checkIntervalMs).unref();
+        this.histogram.reset();
+        this.timer = setInterval(() => this.evaluateHealth(), this.checkIntervalMs);
+        this.timer.unref();
+    }
+
+    public stop(): void {
+        this.isRunning = false;
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null;
+        }
+        this.histogram.disable();
+    }
+
+    public dispose(): void {
+        this.stop();
+        this.histogram.reset();
     }
 
     public getLevel(): DegradationLevel {
@@ -75,29 +114,52 @@ export class DegradationManager {
         }
     }
 
+    /**
+     * Evaluates system health over the current interval window.
+     * Crucial: Resets the histogram at the end of each evaluation cycle so that each check
+     * measures recent system performance rather than accumulated lifetime percentiles.
+     */
     public evaluateHealth(): void {
         const p99EventLoopDelayMs = this.histogram.percentile(99) / 1e6;
 
-        if (p99EventLoopDelayMs > 250) {
-            // Immediate escalation to EMERGENCY
-            this.consecutiveHealthyChecks = 0;
-            this.setDegradationLevel(DegradationLevel.EMERGENCY, `Severe event loop lag: ${p99EventLoopDelayMs.toFixed(1)}ms`);
-        } else if (p99EventLoopDelayMs > 100) {
-            this.consecutiveHealthyChecks = 0;
-            this.setDegradationLevel(DegradationLevel.HIGH_LOAD, `High event loop lag: ${p99EventLoopDelayMs.toFixed(1)}ms`);
-        } else if (p99EventLoopDelayMs > 40) {
-            this.consecutiveHealthyChecks = 0;
-            this.setDegradationLevel(DegradationLevel.ELEVATED, `Elevated event loop lag: ${p99EventLoopDelayMs.toFixed(1)}ms`);
-        } else {
-            // Healthy check: enforce hysteresis to prevent rapid flapping
-            this.consecutiveHealthyChecks++;
-            if (this.consecutiveHealthyChecks >= this.recoveryHysteresisCycles && this.currentLevel !== DegradationLevel.NORMAL) {
-                const previousLevel = this.currentLevel;
-                // Step down one level at a time
-                const nextLevel = (previousLevel - 1) as DegradationLevel;
+        // Check memory saturation (heap usage ratio)
+        const mem = process.memoryUsage();
+        const heapUsageRatio = mem.heapTotal > 0 ? mem.heapUsed / mem.heapTotal : 0;
+
+        try {
+            if (p99EventLoopDelayMs > 250 || heapUsageRatio > 0.95) {
+                // Immediate escalation to EMERGENCY
                 this.consecutiveHealthyChecks = 0;
-                this.setDegradationLevel(nextLevel, `System health sustained: ${this.recoveryHysteresisCycles} consecutive healthy cycles`);
+                this.setDegradationLevel(
+                    DegradationLevel.EMERGENCY,
+                    `Critical resource pressure: p99 lag ${p99EventLoopDelayMs.toFixed(1)}ms, heap ${(heapUsageRatio * 100).toFixed(0)}%`
+                );
+            } else if (p99EventLoopDelayMs > 100 || heapUsageRatio > 0.85) {
+                this.consecutiveHealthyChecks = 0;
+                this.setDegradationLevel(
+                    DegradationLevel.HIGH_LOAD,
+                    `High resource pressure: p99 lag ${p99EventLoopDelayMs.toFixed(1)}ms, heap ${(heapUsageRatio * 100).toFixed(0)}%`
+                );
+            } else if (p99EventLoopDelayMs > 40) {
+                this.consecutiveHealthyChecks = 0;
+                this.setDegradationLevel(
+                    DegradationLevel.ELEVATED,
+                    `Elevated event loop lag: ${p99EventLoopDelayMs.toFixed(1)}ms`
+                );
+            } else {
+                // Healthy check: enforce hysteresis to prevent rapid flapping
+                this.consecutiveHealthyChecks++;
+                if (this.consecutiveHealthyChecks >= this.recoveryHysteresisCycles && this.currentLevel !== DegradationLevel.NORMAL) {
+                    const previousLevel = this.currentLevel;
+                    // Step down one level at a time
+                    const nextLevel = (previousLevel - 1) as DegradationLevel;
+                    this.consecutiveHealthyChecks = 0;
+                    this.setDegradationLevel(nextLevel, `System health sustained: ${this.recoveryHysteresisCycles} consecutive healthy cycles`);
+                }
             }
+        } finally {
+            //? Reset histogram to capture a clean measurement window for the next interval
+            this.histogram.reset();
         }
     }
 

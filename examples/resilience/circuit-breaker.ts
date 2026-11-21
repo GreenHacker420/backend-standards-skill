@@ -11,17 +11,20 @@ export interface CircuitBreakerOptions {
  * Protects upstream services from cascading failures during downstream outages.
  * 
  * Correctness Guarantees:
- * 1. Success in CLOSED state resets consecutive failure count to 0, preventing slow cumulative tripping.
- * 2. In HALF_OPEN state, permits exactly ONE concurrent probe execution. Concurrent callers are rejected
- *    fast while downstream health is verified.
- * 3. If the probe in HALF_OPEN fails, the circuit trips back to OPEN immediately without needing multiple failures.
- * 4. If the probe in HALF_OPEN succeeds, the circuit fully resets to CLOSED.
+ * 1. Epoch / Generation Token:
+ *    Every state transition increments an internal `epoch` counter. Stale requests started in a previous
+ *    state/epoch cannot accidentally reset or trip the circuit upon late completion.
+ * 2. Designated Probe Execution in HALF_OPEN:
+ *    Permits exactly ONE designated probe in `HALF_OPEN` for the current epoch. Concurrent callers are rejected
+ *    fast. Only the designated probe's outcome determines whether the circuit closes or trips back to OPEN.
+ * 3. Success in CLOSED resets consecutive failures to 0, preventing slow cumulative tripping.
  */
 export class CircuitBreaker {
     private failureCount = 0;
     private state: CircuitState = 'CLOSED';
     private nextAttemptTime = 0;
     private isProbeInFlight = false;
+    private epoch = 0; // Generation token prevents stale-request state races
     private readonly threshold: number;
     private readonly timeoutMs: number;
 
@@ -47,43 +50,51 @@ export class CircuitBreaker {
             if (now >= this.nextAttemptTime) {
                 this.state = 'HALF_OPEN';
                 this.isProbeInFlight = false;
+                this.epoch++;
             } else {
                 const retryAfterSeconds = Math.max(1, Math.ceil((this.nextAttemptTime - now) / 1000));
                 throw new Error(`Circuit open: downstream dependency is currently unavailable. Retry after ${retryAfterSeconds}s.`);
             }
         }
 
-        // 2. Bound HALF_OPEN execution to a single concurrent probe
+        // 2. Bound HALF_OPEN execution to a single designated probe for this epoch
+        let isDesignatedProbe = false;
         if (this.state === 'HALF_OPEN') {
             if (this.isProbeInFlight) {
                 throw new Error('Circuit probe currently in flight. Downstream service is recovering. Please retry shortly.');
             }
             this.isProbeInFlight = true;
+            isDesignatedProbe = true;
         }
+
+        const requestEpoch = this.epoch;
 
         try {
             const result = await action();
 
             //? Success Handling:
-            if (this.state === 'HALF_OPEN') {
+            //? Only actions originating in the current epoch can influence circuit state.
+            if (isDesignatedProbe && this.epoch === requestEpoch) {
                 // Probe succeeded: fully recover to CLOSED
                 this.reset();
-            } else if (this.state === 'CLOSED') {
+            } else if (this.state === 'CLOSED' && this.epoch === requestEpoch) {
                 // Success in CLOSED resets consecutive failures
                 this.failureCount = 0;
             }
 
             return result;
         } catch (err) {
-            if (this.state === 'HALF_OPEN') {
-                //? Probe failed: immediately trip back to OPEN with full timeout
+            if (isDesignatedProbe && this.epoch === requestEpoch) {
+                //? Probe failed: immediately trip back to OPEN with full cool-down timeout
                 this.isProbeInFlight = false;
                 this.state = 'OPEN';
+                this.epoch++;
                 this.nextAttemptTime = Date.now() + this.timeoutMs;
-            } else if (this.state === 'CLOSED') {
+            } else if (this.state === 'CLOSED' && this.epoch === requestEpoch) {
                 this.failureCount++;
                 if (this.failureCount >= this.threshold) {
                     this.state = 'OPEN';
+                    this.epoch++;
                     this.nextAttemptTime = Date.now() + this.timeoutMs;
                 }
             }
@@ -96,10 +107,10 @@ export class CircuitBreaker {
         this.state = 'CLOSED';
         this.nextAttemptTime = 0;
         this.isProbeInFlight = false;
+        this.epoch++;
     }
 
     public getState(): CircuitState {
-        // Transparently evaluate expired OPEN state on query
         if (this.state === 'OPEN' && Date.now() >= this.nextAttemptTime) {
             return 'HALF_OPEN';
         }
@@ -108,6 +119,10 @@ export class CircuitBreaker {
 
     public getFailureCount(): number {
         return this.failureCount;
+    }
+
+    public getEpoch(): number {
+        return this.epoch;
     }
 
     public isAvailable(): boolean {

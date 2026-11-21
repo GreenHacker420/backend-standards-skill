@@ -52,15 +52,19 @@ When authoring backend code, adhere strictly to these core principles:
     - Register shutdown coordinators handling `SIGTERM` / `SIGINT` to drain in-flight requests, pause queue consumers, finish active jobs, and disconnect pools cleanly before exiting.
 12. **Class-Based Subsystems for Stateful Infrastructure**: Use classes **only** for stateful components that maintain connections, lifecycles, connection pooling, or event listeners (e.g., `CacheManager`, `PubSubManager`, `MailClient`, `S3Client`, `Database`).
 13. **Action-Based Controller Decomposition (1 Action = 1 File)**: Never create a monolithic 1,000-line controller class. Split each API action into its own file (`create.ts`, `update.ts`, `archive.ts`, `get-pool.ts`).
-14. **Domain Orchestrator Pattern**: Complex workflows that touch multiple subsystems (DB + S3 + Cache + BullMQ + PubSub) belong in `src/lib/<domain>/`, keeping HTTP controllers focused; roughly 65 lines is an advisory review threshold, not a hard cap.
-15. **Inline Schema Validation with Type Inference**: Define request validation schemas (using Zod or Joi) directly at the top of each controller file. Infer and export the request DTO type.
+14. **Domain Orchestrator Pattern**: Complex workflows that touch multiple subsystems (DB + S3 + Cache + BullMQ + PubSub) belong in domain orchestrators, keeping HTTP controllers focused on transport logic. Roughly 65 lines is an advisory review threshold, not a hard cap.
+    - *In Layered / Domain-Grouped architectures*: Place in `src/lib/<domain>/`.
+    - *In Modular Vertical Slice architectures*: Place in `src/modules/<feature>/orchestrators/`.
+15. **Request Validation Schemas with Type Inference**: Define request validation schemas (using Zod) at system boundaries. Infer and export request DTO types:
+    - *In Layered architectures*: Define inline or adjacent to controller files.
+    - *In Modular Vertical Slices*: Place in `src/modules/<feature>/schemas/`.
 16. **Ambient Typing & Namespace Augmentation**: Extend Express's `Request` and Prisma's JSON types ambiently in `src/typings/index.d.ts` so all handlers receive typed access to auth sessions, correlation IDs, and loggers without type assertions (`as any`).
 17. **Semantic Commenting Taxonomy**: Use visual semantic tags (`//?`, `//!`, `//&`, `//*`) to clearly convey rationale, critical hazards, domain boundaries, and business constraints.
 18. **Fail-Fast Boot**: Validate all environment variables and secrets at application boot using Zod. The server must crash immediately on boot if configuration is missing or malformed.
 19. **Type-Safe API Contracts**: Use generic response formatting helpers (`sendResponse<T>`, `sendArrayResponse<T>`, `sendError`) across all HTTP endpoints.
-20. **Modular & Vertical Slice Architecture**: Structure large domain systems into feature-oriented modules (`src/modules/<feature>/`) that encapsulate their own routes, actions, orchestrators, schemas, and repositories, rather than sprawling horizontal layers.
-21. **Tail-Based Tracing**: Buffer in-flight spans in-memory and evaluate sampling decisions at request completion to capture 100% of errors and p99 latency spikes while downsampling healthy fast requests.
-22. **Retry Budgets & Preventing Retry Storms**: Enforce a token bucket retry budget (max 10% retries) with Full Jitter backoff and strict transient vs terminal error classification to prevent retry storms.
+20. **Modular & Vertical Slice Architecture**: Structure multi-domain monoliths into autonomous feature modules (`src/modules/<feature>/`) encapsulating routes, actions, orchestrators, schemas, and projections, rather than sprawling horizontal layers.
+21. **Tail-Based Tracing**: Buffer in-flight spans in-memory and evaluate sampling decisions at request completion to capture errors and p99 latency spikes on a best-effort basis while downsampling healthy fast requests. For mission-critical multi-pod scale, deploy an OpenTelemetry Collector tail-sampling processor.
+22. **Retry Budgets & Preventing Retry Storms**: Enforce a token bucket retry governor (target retry ratio, e.g. 10%, with burst capacity) with AWS Full Jitter backoff and strict transient vs terminal error classification to prevent retry storms.
 23. **Dead Letter Queue (DLQ) & Poison Pill Quarantine**: Quarantine unprocessable queue messages after max attempts and provide administrative re-drive capabilities.
 24. **Singleflight (Cache Stampede Prevention)**: Coalesce concurrent in-flight requests for identical keys to protect downstream databases from thundering herds.
 25. **Parse, Don't Validate & Smart Constructors**: Parse raw input at system boundaries into branded types (`Email`, `UserId`, `Money`) that cannot exist in an invalid state. Internal services must never defensively re-validate.

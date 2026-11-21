@@ -1,6 +1,6 @@
 export interface SingleflightOptions {
   readonly maxInFlightKeys?: number; // Bound key cardinality (default: 10000)
-  readonly timeoutMs?: number;       // Optional execution timeout per coalesced flight
+  readonly timeoutMs?: number;       // Optional caller wait timeout
 }
 
 /**
@@ -11,9 +11,11 @@ export interface SingleflightOptions {
  * 
  * Safety Guarantees:
  * 1. Strict Generic Typing: Zero `any` casts; return types are fully preserved.
- * 2. Guaranteed Cleanup: Always removes keys in `finally` blocks, even on cancellation or error.
+ * 2. Independent Caller Timeout from Operation Lifecycle:
+ *    If an individual caller's wait times out, the shared flight remains registered in `inFlight`
+ *    until the underlying operation actually settles. This prevents concurrent callers from spawning
+ *    duplicate background work when operations are slow.
  * 3. Bounded Cardinality: Drops new coalescing when `maxInFlightKeys` is saturated to prevent heap exhaustion.
- * 4. Optional Timeout Protection: Prevents hung promises from wedging keys indefinitely.
  */
 export class Singleflight {
   private inFlight = new Map<string, Promise<unknown>>();
@@ -29,40 +31,47 @@ export class Singleflight {
     }
   }
 
-  public async do<T>(key: string, fn: () => Promise<T>, timeoutMs?: number): Promise<T> {
-    const existing = this.inFlight.get(key);
-    if (existing) {
-      return existing as Promise<T>;
-    }
+  public async do<T>(key: string, fn: () => Promise<T>, callerTimeoutMs?: number): Promise<T> {
+    let flightPromise = this.inFlight.get(key) as Promise<T> | undefined;
 
-    // Bounded capacity check: if saturated, execute directly without coalescing
-    if (this.inFlight.size >= this.maxInFlightKeys) {
-      return fn();
-    }
+    if (!flightPromise) {
+      // Bounded capacity check: if saturated, execute directly without coalescing
+      if (this.inFlight.size >= this.maxInFlightKeys) {
+        return fn();
+      }
 
-    const effectiveTimeoutMs = timeoutMs ?? this.defaultTimeoutMs;
-
-    const flightPromise = (async () => {
-      let timer: NodeJS.Timeout | undefined;
-      try {
-        if (effectiveTimeoutMs && effectiveTimeoutMs > 0) {
-          const timeoutPromise = new Promise<never>((_, reject) => {
-            timer = setTimeout(() => {
-              reject(new Error(`[Singleflight] Operation timed out after ${effectiveTimeoutMs}ms for key: ${key}`));
-            }, effectiveTimeoutMs);
-            timer.unref();
-          });
-          return await Promise.race([fn(), timeoutPromise]);
+      // The shared underlying execution promise manages its own lifecycle in inFlight.
+      // It deletes its key ONLY when the underlying operation settles, regardless of caller timeouts.
+      flightPromise = (async () => {
+        try {
+          return await fn();
+        } finally {
+          this.inFlight.delete(key);
         }
-        return await fn();
+      })();
+
+      this.inFlight.set(key, flightPromise);
+    }
+
+    const effectiveTimeoutMs = callerTimeoutMs ?? this.defaultTimeoutMs;
+
+    if (effectiveTimeoutMs && effectiveTimeoutMs > 0) {
+      let timer: NodeJS.Timeout | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`[Singleflight] Caller wait timed out after ${effectiveTimeoutMs}ms for key: ${key}`));
+        }, effectiveTimeoutMs);
+        timer.unref();
+      });
+
+      try {
+        return await Promise.race([flightPromise, timeoutPromise]);
       } finally {
         if (timer) clearTimeout(timer);
-        this.inFlight.delete(key);
       }
-    })();
+    }
 
-    this.inFlight.set(key, flightPromise);
-    return flightPromise;
+    return await flightPromise;
   }
 
   public activeCount(): number {

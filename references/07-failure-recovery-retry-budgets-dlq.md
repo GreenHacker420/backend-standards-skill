@@ -14,9 +14,10 @@ When an upstream dependency slows down, this surge of retries pushes it into a h
    - Retry ONLY at the layer immediately above the failing dependency.
    - Intermediate proxies and orchestrators must propagate errors rather than retrying.
 
-2. **Retry Budget (Google SRE Standard):**
-   - Retries must never exceed **10% of total outbound requests** in a rolling 60-second window.
-   - Enforce using a Token Bucket: successful requests deposit tokens; retries withdraw tokens. If the bucket is empty, fail fast immediately.
+2. **Retry Budget (Google SRE Pattern):**
+   - Target an explicit retry ratio (e.g. 10% of outbound requests) with burst capacity to absorb transient hiccups.
+   - Enforce using a Token Bucket: regular requests deposit fractional tokens (e.g. 0.10 tokens per initial request); retries withdraw 1.0 token. If available tokens < 1.0, retries fail fast immediately.
+   - *Architecture Note*: A process-local token bucket acts as an in-memory rate governor per Node.js instance with bootstrap burst capacity. For mathematically strict fleet-wide quotas across hundreds of distributed pods, enforce retry budgets at the service mesh layer (Envoy/Linkerd) or back the governor with an atomic Redis script.
 
 3. **Full Jitter Exponential Backoff:**
    - Never use fixed or unjittered exponential delays (which cause synchronized client lockstep thundering herds).

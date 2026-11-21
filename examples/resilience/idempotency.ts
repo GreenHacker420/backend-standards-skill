@@ -12,7 +12,8 @@ export interface LoggerInterface {
 export interface CacheIdempotencyOptions {
     readonly pendingTtlSeconds?: number;   //? Short lease for in-flight requests (default: 60s) preventing indefinite lockout on crash
     readonly completedTtlSeconds?: number; //? Retention window for completed responses (default: 86400s / 24h)
-    readonly failClosed?: boolean;         //! Invariant: If completion cannot be persisted, fail to avoid untracked mutations
+    readonly failClosed?: boolean;         //! If lock cannot be checked at entry, reject with 503 to avoid uncoordinated mutation
+    readonly sessionValidator?: (token: string) => string | null; //? Validates server-signed session identity for anonymous requests
     readonly logger?: LoggerInterface;
 }
 
@@ -27,9 +28,8 @@ export const IdempotencyKeySchema = z
 export const ClientSessionIdSchema = z
     .string()
     .trim()
-    .min(16, 'Client session ID must be at least 16 characters')
-    .max(64, 'Client session ID must be at most 64 characters')
-    .regex(/^[a-zA-Z0-9_-]+$/, 'Client session ID must contain only URL-safe alphanumeric, underscore, or hyphen characters');
+    .min(16, 'Client session token must be at least 16 characters')
+    .max(256, 'Client session token must be at most 256 characters');
 
 interface StoredIdempotencyRecord {
     status: 'pending' | 'completed';
@@ -143,6 +143,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
         pendingTtlSeconds = 60,       // Short lease for pending execution (prevents 24h lockout on crash)
         completedTtlSeconds = 86400,  // Full 24h retention for completed responses
         failClosed = true,
+        sessionValidator,
         logger,
     } = options;
 
@@ -160,7 +161,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             return next();
         }
 
-        // 1. Parse and validate boundary key via Zod (using Zod v4 error.issues)
+        // 1. Parse and validate boundary key via Zod
         const keyParseResult = IdempotencyKeySchema.safeParse(rawKey);
         if (!keyParseResult.success) {
             res.status(400).json({
@@ -172,35 +173,49 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
 
         const idempotencyKey = keyParseResult.data;
 
-        //? Tenant Isolation & Anti-Collision:
-        //? For authenticated requests, scope by organization and authenticated user.
-        //? For unauthenticated public mutations, require X-Client-Session-Id header to prevent
-        //? all anonymous callers from sharing a single collided namespace.
+        //? Tenant & Actor Isolation:
+        //? For authenticated requests, scope by organization AND verified user ID.
+        //? For unauthenticated public mutations, require a server-verified session token
+        //? (e.g. via sessionValidator) to prevent client-spoofed namespace collisions.
         let tenantScope: string;
         if (req.currentOrganizationUser?.organizationId && req.currentOrganizationUser?.userId) {
             tenantScope = `org:${req.currentOrganizationUser.organizationId}:usr:${req.currentOrganizationUser.userId}`;
         } else {
-            const rawSessionId = req.header('X-Client-Session-Id');
-            const sessionParseResult = ClientSessionIdSchema.safeParse(rawSessionId);
+            const rawSessionToken = req.header('X-Client-Session-Id') ?? req.header('Authorization');
+            const sessionParseResult = ClientSessionIdSchema.safeParse(rawSessionToken);
             if (!sessionParseResult.success) {
                 res.status(400).json({
                     error: true,
-                    message: 'Unauthenticated requests using Idempotency-Key must provide a valid X-Client-Session-Id header (16-64 alphanumeric chars).',
+                    message: 'Unauthenticated requests using Idempotency-Key must provide a verified session identity.',
                 });
                 return;
             }
-            tenantScope = `session:${sessionParseResult.data}`;
+
+            // Verify session token via server signature if validator is configured
+            const verifiedSessionId = sessionValidator
+                ? sessionValidator(sessionParseResult.data)
+                : null;
+
+            if (sessionValidator && !verifiedSessionId) {
+                res.status(401).json({
+                    error: true,
+                    message: 'Invalid or forged session identity for unauthenticated idempotency key.',
+                });
+                return;
+            }
+
+            tenantScope = `session:${verifiedSessionId ?? sessionParseResult.data}`;
         }
 
         const routePath = req.baseUrl + (req.route?.path ?? req.path);
         
-        // Scope prevents cross-tenant or cross-route collision
+        // Scope prevents cross-tenant, cross-actor, or cross-route collision
         const redisKey = `idempotency:${tenantScope}:${req.method.toUpperCase()}:${routePath}:${idempotencyKey}`;
         const currentFingerprint = computeRequestFingerprint(req);
         const ownerToken = crypto.randomUUID();
         let stopHeartbeat = () => {};
 
-        //? Create AbortController to signal downstream handlers on premature client disconnect
+        //? Create AbortController to signal cancelable downstream tasks
         const abortController = new AbortController();
         (req as unknown as { idempotencyAbortSignal?: AbortSignal }).idempotencyAbortSignal = abortController.signal;
 
@@ -290,7 +305,6 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             let consecutiveHeartbeatFailures = 0;
 
             //? Heartbeat lease renewal: extends lease every pendingTtlSeconds / 3 while operation is running.
-            //? If Redis fails or lease is overtaken, leaseHealthValid becomes false and triggers fail-closed behavior.
             const heartbeatIntervalMs = Math.max(1000, Math.floor((pendingTtlSeconds * 1000) / 3));
             let heartbeatTimer: NodeJS.Timeout | null = setInterval(async () => {
                 try {
@@ -304,7 +318,6 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                     if (extended === 1) {
                         consecutiveHeartbeatFailures = 0;
                     } else {
-                        // Key expired or lease was overtaken by a concurrent retry!
                         leaseHealthValid = false;
                         stopHeartbeat();
                         logger?.error('[Idempotency] Pending lease lost or overtaken by concurrent request.', {
@@ -336,17 +349,22 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                 }
             };
 
-            //? Lifecycle & Premature Disconnect Handling:
-            //? Clean completion stops the heartbeat tracker.
-            //? Premature client abort (!res.writableEnded) aborts downstream signal and safely releases
-            //? the pending lease via compare-and-delete so subsequent client retries are not locked out.
+            //? Disconnect Safety Invariant:
+            //? On client disconnect (!res.writableEnded), we abort the signal and STOP heartbeat renewal,
+            //? but we DO NOT immediately delete the Redis key!
+            //? Why: An arbitrary database mutation or un-instrumented handler may still be executing and commit
+            //? in the background. Immediate deletion would allow a concurrent client retry to acquire the key
+            //? and execute duplicate mutations!
+            //? Leaving the short pending lease to expire naturally prevents this race condition.
             res.once('finish', () => stopHeartbeat());
             res.once('close', () => {
                 stopHeartbeat();
                 if (!res.writableEnded && !isCompleted) {
                     abortController.abort();
-                    // Clean up pending lock so subsequent retries are not locked out for pendingTtlSeconds
-                    void redis.eval(COMPARE_AND_DELETE_LUA, 1, redisKey, ownerToken).catch(() => {});
+                    logger?.warn('[Idempotency] Client disconnected with mutation in flight. Halting lease heartbeat; pending lease retained until natural TTL expiration to prevent concurrent execution race.', {
+                        redisKey,
+                        ownerToken,
+                    });
                 }
             });
 
@@ -394,7 +412,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                         );
                         return result === 1;
                     } else {
-                        // Compare-and-delete: only delete if THIS ownerToken still owns the key (prevents deleting next lease)
+                        // Compare-and-delete for failed operations (e.g. 4xx validation errors)
                         await redis.eval(COMPARE_AND_DELETE_LUA, 1, redisKey, ownerToken);
                         return true;
                     }
@@ -416,16 +434,18 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                 responseHandled = true;
 
                 void persistCompletion(res.statusCode, body).then((persisted) => {
-                    //! Fail-closed: If completion cannot be persisted in Redis, report 503 using unpatched sender
-                    if (!persisted && failClosed && res.statusCode >= 200 && res.statusCode < 300) {
-                        res.status(503);
-                        if (mode === 'json') {
-                            return originalJson({
-                                error: true,
-                                message: 'Operation executed but idempotency confirmation failed. Contact support before retrying.',
-                            });
-                        }
-                        return originalSend('Operation executed but idempotency confirmation failed. Contact support before retrying.');
+                    //? Correctness Guarantee on Redis Write Failure:
+                    //? If the downstream business mutation succeeded (2xx), but Redis completion persistence failed,
+                    //? the mutation HAS already committed in PostgreSQL!
+                    //? NEVER report 503 Service Unavailable here, as doing so misleads the client into believing
+                    //? the transaction failed and triggers duplicate retries. Instead, deliver the committed response
+                    //? and set an observability warning header.
+                    if (!persisted && res.statusCode >= 200 && res.statusCode < 300) {
+                        logger?.error('[Idempotency] Redis completion cache write failed for successfully committed mutation. Delivering committed response to client to prevent duplicate retry.', {
+                            redisKey,
+                            statusCode: res.statusCode,
+                        });
+                        res.setHeader('X-Idempotency-Cache', 'WRITE_FAILED');
                     }
                     sender();
                 });
@@ -474,6 +494,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
  * CREATE TABLE idempotency_records (
  *     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
  *     organization_id INTEGER NOT NULL,
+ *     user_id VARCHAR(64) NOT NULL,
  *     scope VARCHAR(128) NOT NULL,
  *     idempotency_key VARCHAR(64) NOT NULL,
  *     request_fingerprint CHAR(64) NOT NULL,
@@ -481,9 +502,9 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
  *     http_code INTEGER,
  *     response_headers JSONB,
  *     response_body JSONB,
- *     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ *     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
  *     expires_at TIMESTAMPTZ NOT NULL,
- *     CONSTRAINT uq_idempotency_scope_key UNIQUE (organization_id, scope, idempotency_key)
+ *     CONSTRAINT uq_idempotency_scope_key UNIQUE (organization_id, user_id, scope, idempotency_key)
  * );
  * CREATE INDEX idx_idempotency_cleanup ON idempotency_records (expires_at) WHERE status = 'COMPLETED';
  * ```
@@ -503,6 +524,7 @@ export interface PrismaClientLike<TTx extends DbRawTransactionClient = DbRawTran
 
 export interface DbIdempotencyOptions {
     organizationId: number;
+    userId: string | number;
     scope: string;
     idempotencyKey: string;
     requestFingerprint: string;
@@ -521,36 +543,11 @@ export interface IdempotentExecutionResult<T> {
  * Executes a mission-critical business transaction inside PostgreSQL with durable idempotency.
  * Guarantees zero duplicate mutations and atomic state transitions under ACID guarantees.
  * 
- * Production Safety Rules:
- * 1. Transactional Atomicity by Construction:
- *    Accepts `prisma: PrismaClientLike<TTx>` and constructs the interactive `$transaction` internally.
- *    The generic `TTx` preserves Prisma's generated model delegates (e.g. `tx.order.create()`) while
- *    requiring `$queryRaw` and `$executeRaw` for idempotency management.
- * 2. Atomic Expiration & Key Reclamation via Database Clock:
- *    Expiration is strictly evaluated against PostgreSQL's `clock_timestamp()` inside SQL. If an existing
- *    record is expired, it is atomically reclaimed and reset to PENDING with the new fingerprint,
- *    eliminating reliance on external cleanup crons or vulnerable application-server clock synchronization.
- * 3. Unprotected Side Effects Prohibited:
- *    NEVER perform non-transactional external side effects (e.g. charging a payment card, publishing
- *    Kafka messages, external HTTP webhooks) directly inside `operation(tx)`. Use the Transactional
- *    Outbox Pattern so side effects only dispatch after this database transaction commits.
- * 4. Failure Rollback Semantics:
- *    When `operation(tx)` throws an error, PostgreSQL aborts the entire interactive transaction.
- *    Both partial business mutations and the PENDING idempotency record are cleanly rolled back,
- *    freeing the key for safe subsequent retries without orphaned locks.
- * 
- * Example Usage:
- * ```typescript
- * const result = await executeWithDbIdempotency(prisma, {
- *     organizationId: req.tenantId,
- *     scope: 'orders.checkout',
- *     idempotencyKey: req.headers['idempotency-key'],
- *     requestFingerprint: computeRequestFingerprint(req),
- * }, async (tx) => {
- *     const order = await tx.order.create({ data: orderInput });
- *     return { httpCode: 201, body: order, headers: { location: `/orders/${order.id}` } };
- * });
- * ```
+ * Correctness Invariants:
+ * 1. Actor-Scoped Uniqueness: Scoped to (organization_id, user_id, scope, idempotency_key) so actor-specific
+ *    responses are never replayed cross-user.
+ * 2. Transactional Atomicity by Construction: Interactive $transaction created internally.
+ * 3. Expiration by Database Clock: Expiration strictly evaluated against clock_timestamp().
  */
 export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransactionClient = DbRawTransactionClient>(
     prisma: PrismaClientLike<TTx>,
@@ -563,6 +560,7 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
 ): Promise<IdempotentExecutionResult<TResult>> {
     const {
         organizationId,
+        userId,
         scope,
         idempotencyKey,
         requestFingerprint,
@@ -570,9 +568,14 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
         transactionTimeoutMs = 10000,
     } = options;
 
-    //? Boundary Validation: Options verification prevents injection and invalid states
+    const normalizedUserId = String(userId);
+
+    // Boundary Validation
     if (!Number.isInteger(organizationId) || organizationId <= 0) {
         throw new TypeError('[DbIdempotency] organizationId must be a positive integer.');
+    }
+    if (!normalizedUserId || normalizedUserId.length > 64) {
+        throw new TypeError('[DbIdempotency] userId must be a non-empty string <= 64 characters.');
     }
     if (!scope || typeof scope !== 'string' || scope.length > 128) {
         throw new TypeError('[DbIdempotency] scope must be a non-empty string <= 128 characters.');
@@ -583,27 +586,22 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
     if (!requestFingerprint || typeof requestFingerprint !== 'string' || requestFingerprint.length !== 64) {
         throw new TypeError('[DbIdempotency] requestFingerprint must be a 64-character hex string.');
     }
-    if (!Number.isInteger(ttlMinutes) || ttlMinutes <= 0) {
-        throw new TypeError('[DbIdempotency] ttlMinutes must be a positive integer.');
-    }
-    if (!Number.isInteger(transactionTimeoutMs) || transactionTimeoutMs < 1000) {
-        throw new TypeError('[DbIdempotency] transactionTimeoutMs must be an integer >= 1000ms.');
-    }
 
     return prisma.$transaction(async (tx) => {
         // 1. Attempt atomic insertion of PENDING record with ON CONFLICT DO NOTHING
         const insertCount = await tx.$executeRaw`
             INSERT INTO idempotency_records (
-                organization_id, scope, idempotency_key, request_fingerprint, status, expires_at
+                organization_id, user_id, scope, idempotency_key, request_fingerprint, status, expires_at
             ) VALUES (
                 ${organizationId},
+                ${normalizedUserId},
                 ${scope},
                 ${idempotencyKey},
                 ${requestFingerprint},
                 'PENDING',
                 clock_timestamp() + (${`${ttlMinutes} minutes`})::INTERVAL
             )
-            ON CONFLICT (organization_id, scope, idempotency_key) DO NOTHING;
+            ON CONFLICT (organization_id, user_id, scope, idempotency_key) DO NOTHING;
         `;
 
         // 2. If record already existed (insertCount === 0), evaluate existing record
@@ -620,6 +618,7 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
                        (expires_at <= clock_timestamp()) AS is_expired
                 FROM idempotency_records
                 WHERE organization_id = ${organizationId}
+                  AND user_id = ${normalizedUserId}
                   AND scope = ${scope}
                   AND idempotency_key = ${idempotencyKey}
                 FOR UPDATE;
@@ -630,7 +629,7 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
                 throw new Error('Concurrent idempotency race: record not found after conflict.');
             }
 
-            //? Expiration Enforcement: Evaluated via PostgreSQL clock_timestamp() to avoid server clock skew
+            // Expiration Enforcement via PostgreSQL clock_timestamp()
             if (existing.is_expired) {
                 await tx.$executeRaw`
                     UPDATE idempotency_records
@@ -642,16 +641,15 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
                         expires_at = clock_timestamp() + (${`${ttlMinutes} minutes`})::INTERVAL,
                         created_at = clock_timestamp()
                     WHERE organization_id = ${organizationId}
+                      AND user_id = ${normalizedUserId}
                       AND scope = ${scope}
                       AND idempotency_key = ${idempotencyKey};
                 `;
             } else {
-                //! Invariant check: Fingerprint mismatch indicates key reuse with different input
                 if (existing.request_fingerprint !== requestFingerprint) {
                     throw new Error('Idempotency conflict: key was previously used with a different request payload.');
                 }
 
-                //? Safely replays valid responses with 204 No Content, null, false, 0, or empty string bodies
                 if (existing.status === 'COMPLETED' && typeof existing.http_code === 'number') {
                     return {
                         isReplay: true,
@@ -670,12 +668,12 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
         // 3. Execute the core business operation passing tx to guarantee transactional binding
         const result = await operation(tx);
 
-        // 4. Safely serialize body (handling undefined -> null for 204 responses) and allowlisted headers
+        // 4. Safely serialize body and allowlisted headers
         const serializedBody = result.body === undefined ? null : JSON.stringify(result.body);
         const filteredHeaders = filterReplayHeaders(result.headers);
         const serializedHeaders = filteredHeaders ? JSON.stringify(filteredHeaders) : null;
 
-        // 5. Atomically persist COMPLETED state and response body within the same ACID transaction
+        // 5. Atomically persist COMPLETED state within the same ACID transaction
         await tx.$executeRaw`
             UPDATE idempotency_records
             SET status = 'COMPLETED',
@@ -683,6 +681,7 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
                 response_headers = ${serializedHeaders}::jsonb,
                 response_body = ${serializedBody}::jsonb
             WHERE organization_id = ${organizationId}
+              AND user_id = ${normalizedUserId}
               AND scope = ${scope}
               AND idempotency_key = ${idempotencyKey};
         `;

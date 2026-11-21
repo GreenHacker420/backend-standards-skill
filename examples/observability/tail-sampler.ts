@@ -1,13 +1,15 @@
 /**
- * In-Memory Tail-Based Tracing Decision Helper (Heuristic Filter)
+ * In-Memory Tail-Based Tracing Decision Helper (Best-Effort Heuristic Filter)
  * 
  * Production Architecture Notice:
- * For multi-instance distributed tracing, the OpenTelemetry Collector with its
- * `tail_sampling` processor is the industry standard.
+ * For mission-critical multi-instance distributed tracing at scale, an out-of-process OpenTelemetry Collector
+ * cluster with its official `tail_sampling` processor is the industry standard.
  * 
  * This in-memory sampler demonstrates the decision heuristics for buffering in-flight spans
- * and evaluating sampling decisions upon request completion (retaining 100% of errors
- * and slow-request outliers, while downsampling healthy fast requests).
+ * within a single Node.js process and evaluating sampling decisions upon request completion.
+ * Because in-process memory is bounded (`maxActiveTraces`, `maxSpansPerTrace`), it operates on a
+ * BEST-EFFORT basis: during extreme traffic spikes or memory saturation, traces can be evicted
+ * or marked incomplete to protect the Node.js heap from Out-Of-Memory crashes.
  */
 
 export interface Span {
@@ -24,7 +26,7 @@ export interface Span {
 
 export interface TailSamplingPolicy {
   errorSamplingRate: number;      // 1.0 = 100%
-  slowThresholdMs: number;        // Fixed latency threshold (e.g. 1000ms)
+  slowThresholdMs: number;        // Latency threshold (e.g. 1000ms)
   slowSamplingRate: number;       // 1.0 = 100%
   tier0SamplingRate: number;      // 1.0 = 100%
   baselineSamplingRate: number;   // 0.01 = 1%
@@ -35,6 +37,15 @@ export interface TailSamplingPolicy {
 
 interface InFlightTraceEntry {
   createdAt: number;
+  spans: Span[];
+  droppedSpansCount: number;
+}
+
+export interface SamplingEvaluationResult {
+  sampled: boolean;
+  reason: string;
+  incomplete: boolean;
+  droppedSpansCount: number;
   spans: Span[];
 }
 
@@ -55,7 +66,7 @@ export class TailSampler {
       ...policy,
     };
 
-    //? Validate rates and thresholds
+    // Validate rates and thresholds
     const rates = [
       this.policy.errorSamplingRate,
       this.policy.slowSamplingRate,
@@ -72,7 +83,7 @@ export class TailSampler {
     }
   }
 
-  //? Evicts abandoned traces to guarantee zero unbounded memory growth
+  // Evicts abandoned traces to guarantee zero unbounded memory growth
   private pruneExpiredTraces(): void {
     const now = Date.now();
     for (const [traceId, entry] of this.inFlightTraces.entries()) {
@@ -98,12 +109,15 @@ export class TailSampler {
       entry = {
         createdAt: Date.now(),
         spans: [],
+        droppedSpansCount: 0,
       };
       this.inFlightTraces.set(span.traceId, entry);
     }
 
     if (entry.spans.length < this.policy.maxSpansPerTrace) {
       entry.spans.push(span);
+    } else {
+      entry.droppedSpansCount++;
     }
   }
 
@@ -113,42 +127,80 @@ export class TailSampler {
   public evaluateTrace(
     traceId: string,
     metadata: { statusCode: number; durationMs: number; tier?: number }
-  ): { sampled: boolean; reason: string; spans: Span[] } {
+  ): SamplingEvaluationResult {
     const entry = this.inFlightTraces.get(traceId);
     this.inFlightTraces.delete(traceId);
 
     if (!entry) {
-      return { sampled: false, reason: 'trace_not_found_or_evicted', spans: [] };
+      return {
+        sampled: false,
+        reason: 'trace_not_found_or_evicted',
+        incomplete: true,
+        droppedSpansCount: 0,
+        spans: [],
+      };
     }
 
-    // 1. Errors: 100% sample rate (HTTP 5xx or explicitly flagged error spans)
+    const isIncomplete = entry.droppedSpansCount > 0;
+
+    // 1. Errors: Prioritize retaining error traces (HTTP 5xx or span error flag)
     const hasError = metadata.statusCode >= 500 || entry.spans.some((s) => s.error);
     if (hasError) {
       if (Math.random() < this.policy.errorSamplingRate) {
-        return { sampled: true, reason: 'error_retention', spans: entry.spans };
+        return {
+          sampled: true,
+          reason: 'error_retention',
+          incomplete: isIncomplete,
+          droppedSpansCount: entry.droppedSpansCount,
+          spans: entry.spans,
+        };
       }
     }
 
-    // 2. Slow Requests: 100% sample rate for latency outliers exceeding threshold
+    // 2. Slow Requests: Retain latency outliers exceeding threshold
     if (metadata.durationMs >= this.policy.slowThresholdMs) {
       if (Math.random() < this.policy.slowSamplingRate) {
-        return { sampled: true, reason: 'slow_outlier_retention', spans: entry.spans };
+        return {
+          sampled: true,
+          reason: 'slow_outlier_retention',
+          incomplete: isIncomplete,
+          droppedSpansCount: entry.droppedSpansCount,
+          spans: entry.spans,
+        };
       }
     }
 
-    // 3. Tier 0 Critical Workloads: 100% sample rate
+    // 3. Tier 0 Critical Workloads
     if (metadata.tier === 0) {
       if (Math.random() < this.policy.tier0SamplingRate) {
-        return { sampled: true, reason: 'tier0_revenue_retention', spans: entry.spans };
+        return {
+          sampled: true,
+          reason: 'tier0_revenue_retention',
+          incomplete: isIncomplete,
+          droppedSpansCount: entry.droppedSpansCount,
+          spans: entry.spans,
+        };
       }
     }
 
-    // 4. Baseline Downsampling: Keep small deterministic sample of healthy fast traces
+    // 4. Baseline Probabilistic Downsampling: Retain small fraction of healthy fast traces
     if (Math.random() < this.policy.baselineSamplingRate) {
-      return { sampled: true, reason: 'baseline_sample', spans: entry.spans };
+      return {
+        sampled: true,
+        reason: 'baseline_sample',
+        incomplete: isIncomplete,
+        droppedSpansCount: entry.droppedSpansCount,
+        spans: entry.spans,
+      };
     }
 
-    return { sampled: false, reason: 'dropped_healthy_fast_trace', spans: [] };
+    return {
+      sampled: false,
+      reason: 'dropped_healthy_fast_trace',
+      incomplete: isIncomplete,
+      droppedSpansCount: entry.droppedSpansCount,
+      spans: [],
+    };
   }
 
   public getActiveTraceCount(): number {

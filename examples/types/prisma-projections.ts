@@ -2,10 +2,21 @@ import { Prisma } from '@prisma/client';
 
 /**
  * Type-Safe Prisma Query Projection Pattern
- * Guarantees zero 'as any' and enforces compile-time alignment between SQL and TypeScript.
+ * 
+ * Production Invariant:
+ * Never use loose handwritten DTOs (`interface UserDTO`) that easily drift from underlying SQL queries.
+ * Instead, derive truthful compile-time return types directly from Prisma's generated query selection contract.
+ * 
+ * Prerequisites:
+ * In your application project, define your schema in `prisma/schema.prisma` and run:
+ * ```bash
+ * npx prisma generate
+ * ```
+ * Prisma automatically generates the model `Select` interfaces (e.g. `Prisma.OrganizationUserSelect`)
+ * and payload inference utilities (e.g. `Prisma.OrganizationUserGetPayload<T>`).
  */
 
-// Model delegate types generated in production via prisma generate
+// Model delegate types generated in application projects via `prisma generate`
 declare module '@prisma/client' {
   namespace Prisma {
     export interface OrganizationUserSelect {
@@ -13,29 +24,32 @@ declare module '@prisma/client' {
       email?: boolean;
       firstName?: boolean;
       lastName?: boolean;
-      organization?: {
-        select: {
+      organization?: boolean | {
+        select?: {
           id?: boolean;
           codeName?: boolean;
           timezone?: boolean;
         };
       };
     }
-    export type OrganizationUserGetPayload<T extends { select: unknown }> = {
+
+    // Truly derives the resulting shape from the selection contract T
+    export type OrganizationUserGetPayload<T extends { select?: OrganizationUserSelect }> = {
       id: number;
-      email: string;
-      firstName: string;
-      lastName: string;
-      organization: {
-        id: number;
-        codeName: string;
-        timezone: string;
-      };
-    };
+    } & (T['select'] extends { email: true } ? { email: string } : {})
+      & (T['select'] extends { firstName: true } ? { firstName: string } : {})
+      & (T['select'] extends { lastName: true } ? { lastName: string } : {})
+      & (T['select'] extends { organization: { select: infer S } }
+          ? {
+              organization: (S extends { id: true } ? { id: number } : {})
+                & (S extends { codeName: true } ? { codeName: string } : {})
+                & (S extends { timezone: true } ? { timezone: string } : {});
+            }
+          : {});
   }
 }
 
-// 1. Declare projection using satisfies
+// 1. Declare projection using satisfies against Prisma's generated Select contract
 export const userWithOrgSelect = {
   id: true,
   email: true,
@@ -50,7 +64,8 @@ export const userWithOrgSelect = {
   },
 } as const satisfies Prisma.OrganizationUserSelect;
 
-// 2. Infer exact return type from the select contract
+// 2. Infer exact return type derived from the select contract
+// If you remove 'email: true' from userWithOrgSelect above, UserWithOrgDTO instantly loses the 'email' property!
 export type UserWithOrgDTO = Prisma.OrganizationUserGetPayload<{
   select: typeof userWithOrgSelect;
 }>;
