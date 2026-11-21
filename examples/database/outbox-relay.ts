@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 export interface OutboxPayload {
     eventType: string;
     payload: Record<string, unknown>;
@@ -9,6 +11,7 @@ export interface OutboxRecord {
     payload: Record<string, unknown>;
     status: 'PENDING' | 'PROCESSING' | 'PROCESSED' | 'FAILED';
     attempts: number;
+    claimToken?: string | null;
     createdAt: Date;
     claimedAt?: Date;
     claimExpiresAt?: Date;
@@ -62,6 +65,7 @@ export async function createWithOutbox<T, Tx extends OutboxTransactionClient>(
                 payload: event.payload,
                 status: 'PENDING',
                 attempts: 0,
+                claimToken: null,
                 createdAt: new Date(),
             },
         });
@@ -81,21 +85,27 @@ export interface ClaimedOutboxRow {
     event_type: string;
     payload: Record<string, unknown>;
     attempts: number;
+    claim_token: string;
 }
 
 /**
- * Production-Grade 2-Phase Outbox Relay Worker
+ * Production-Grade 2-Phase Outbox Relay Worker with Claim Fencing
  * 
  * Reliability & Concurrency Rules:
  * 1. Zero Network I/O Inside Database Transactions:
  *    Message broker publishing (Kafka/RabbitMQ/BullMQ) is performed strictly OUTSIDE the database transaction.
  *    Holding open database transactions or row locks during network I/O risks catastrophic connection pool starvation.
- * 2. Short Claim Leases with FOR UPDATE SKIP LOCKED:
- *    Phase 1 atomically claims a batch of pending/expired events and commits immediately.
- *    Multiple concurrent worker instances process independent event batches without lock contention.
- * 3. Stable Event Identifiers for Consumer Deduplication:
+ * 2. Short Claim Leases with FOR UPDATE SKIP LOCKED & Claim Fencing Tokens:
+ *    Phase 1 atomically claims a batch of pending/expired events, assigns a unique `claim_token` (fencing token),
+ *    and commits immediately.
+ * 3. Fencing Protection Against Stale Workers:
+ *    If worker A claims an event with a 60s lease, but its broker publish stalls for 70s, worker B may reclaim
+ *    the expired lease. When worker A finally finishes, its completion/failure update checks `claim_token = $claimToken`.
+ *    Because the token no longer matches, worker A's update affects 0 rows, preventing it from resurrecting or corrupting
+ *    an already processed or reclaimed event.
+ * 4. Stable Event Identifiers for Consumer Deduplication:
  *    Passes stable `eventId` (`row.id`) to the broker so downstream consumers can enforce idempotency.
- * 4. At-Least-Once Delivery:
+ * 5. At-Least-Once Delivery:
  *    Network drops or worker crashes after broker publish but before DB acknowledgment can cause redelivery.
  */
 export class OutboxRelayWorker {
@@ -109,6 +119,7 @@ export class OutboxRelayWorker {
             batchSize?: number;
             pollIntervalMs?: number;
             claimLeaseSeconds?: number;
+            publishTimeoutMs?: number;
             maxAttempts?: number;
             logger?: LoggerInterface;
         } = {}
@@ -145,15 +156,19 @@ export class OutboxRelayWorker {
     }
 
     /**
-     * Executes the 2-phase claim and dispatch cycle.
+     * Executes the 2-phase claim and dispatch cycle with fencing tokens.
      */
     public async pollAndDispatchBatch(): Promise<number> {
         const batchSize = this.options.batchSize ?? 50;
         const claimLeaseSeconds = this.options.claimLeaseSeconds ?? 60;
+        const publishTimeoutMs = this.options.publishTimeoutMs ?? 30000;
         const maxAttempts = this.options.maxAttempts ?? 5;
 
+        // Unique fencing token generated for this worker's claim cycle
+        const claimToken = crypto.randomUUID();
+
         // =========================================================================
-        // PHASE 1: Claim Batch in a Short Database Transaction
+        // PHASE 1: Claim Batch in a Short Database Transaction with Fencing Token
         // =========================================================================
         const claimedEvents = await this.prisma.$transaction(async (tx) => {
             // Select candidates with row locks skipping locked rows
@@ -173,14 +188,15 @@ export class OutboxRelayWorker {
 
             const candidateIds = candidates.map((c) => c.id);
 
-            // Atomically mark batch as PROCESSING with a timed lease
+            // Atomically mark batch as PROCESSING with unique claim_token and timed lease
             const rows = await tx.$queryRaw<ClaimedOutboxRow[]>`
                 UPDATE outbox_events
                 SET status = 'PROCESSING',
+                    claim_token = ${claimToken}::uuid,
                     claimed_at = clock_timestamp(),
                     claim_expires_at = clock_timestamp() + (${`${claimLeaseSeconds} seconds`})::INTERVAL
                 WHERE id = ANY(${candidateIds}::uuid[])
-                RETURNING id, event_type, payload, attempts;
+                RETURNING id, event_type, payload, attempts, claim_token;
             `;
 
             return rows;
@@ -195,23 +211,38 @@ export class OutboxRelayWorker {
         // =========================================================================
         for (const row of claimedEvents) {
             try {
-                // Publish with stable eventId for consumer-side idempotency
-                await this.publisher.publish({
-                    eventId: row.id,
-                    eventType: row.event_type,
-                    payload: row.payload,
-                });
+                // Execute broker publish with bounded timeout to prevent hanging past lease expiration
+                await Promise.race([
+                    this.publisher.publish({
+                        eventId: row.id,
+                        eventType: row.event_type,
+                        payload: row.payload,
+                    }),
+                    new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error(`[OutboxRelay] Broker publish timed out after ${publishTimeoutMs}ms`)), publishTimeoutMs).unref()
+                    ),
+                ]);
 
                 // =====================================================================
-                // PHASE 3: Finalize Successfully Published Record in Database
+                // PHASE 3: Finalize Successfully Published Record with Fencing Check
                 // =====================================================================
-                await this.prisma.$executeRaw`
+                const updatedCount = await this.prisma.$executeRaw`
                     UPDATE outbox_events
                     SET status = 'PROCESSED',
                         processed_at = clock_timestamp(),
-                        claim_expires_at = NULL
-                    WHERE id = ${row.id}::uuid;
+                        claim_expires_at = NULL,
+                        claim_token = NULL
+                    WHERE id = ${row.id}::uuid
+                      AND status = 'PROCESSING'
+                      AND claim_token = ${claimToken}::uuid;
                 `;
+
+                if (updatedCount === 0) {
+                    this.options.logger?.warn('[OutboxRelay] Fencing Conflict: Event claim was lost, expired, or reclaimed by another worker. Stale completion ignored:', {
+                        eventId: row.id,
+                        claimToken,
+                    });
+                }
             } catch (publishErr) {
                 const nextAttempts = row.attempts + 1;
                 const isTerminal = nextAttempts >= maxAttempts;
@@ -219,36 +250,58 @@ export class OutboxRelayWorker {
                 const errorReason = publishErr instanceof Error ? publishErr.message : String(publishErr);
 
                 if (isTerminal) {
-                    await this.prisma.$executeRaw`
+                    const updatedCount = await this.prisma.$executeRaw`
                         UPDATE outbox_events
                         SET status = 'FAILED',
                             attempts = ${nextAttempts},
                             error_reason = ${errorReason},
-                            claim_expires_at = NULL
-                        WHERE id = ${row.id}::uuid;
+                            claim_expires_at = NULL,
+                            claim_token = NULL
+                        WHERE id = ${row.id}::uuid
+                          AND status = 'PROCESSING'
+                          AND claim_token = ${claimToken}::uuid;
                     `;
-                    this.options.logger?.error('[OutboxRelay] Event exceeded maximum delivery attempts; quarantined to FAILED status:', {
-                        id: row.id,
-                        eventType: row.event_type,
-                        attempts: nextAttempts,
-                        errorReason,
-                    });
+
+                    if (updatedCount === 0) {
+                        this.options.logger?.warn('[OutboxRelay] Fencing Conflict: Stale worker terminal failure ignored; claim was already overtaken:', {
+                            eventId: row.id,
+                            claimToken,
+                        });
+                    } else {
+                        this.options.logger?.error('[OutboxRelay] Event exceeded maximum delivery attempts; quarantined to FAILED status:', {
+                            id: row.id,
+                            eventType: row.event_type,
+                            attempts: nextAttempts,
+                            errorReason,
+                        });
+                    }
                 } else {
-                    // Return to PENDING with exponential backoff delay
-                    await this.prisma.$executeRaw`
+                    // Return to PENDING with exponential backoff delay, guarded by fencing token
+                    const updatedCount = await this.prisma.$executeRaw`
                         UPDATE outbox_events
                         SET status = 'PENDING',
                             attempts = ${nextAttempts},
                             error_reason = ${errorReason},
                             claim_expires_at = NULL,
+                            claim_token = NULL,
                             next_attempt_at = clock_timestamp() + (${`${backoffSeconds} seconds`})::INTERVAL
-                        WHERE id = ${row.id}::uuid;
+                        WHERE id = ${row.id}::uuid
+                          AND status = 'PROCESSING'
+                          AND claim_token = ${claimToken}::uuid;
                     `;
-                    this.options.logger?.warn('[OutboxRelay] Transient publish error; rescheduled event with backoff:', {
-                        id: row.id,
-                        nextAttempts,
-                        backoffSeconds,
-                    });
+
+                    if (updatedCount === 0) {
+                        this.options.logger?.warn('[OutboxRelay] Fencing Conflict: Stale worker retry rescheduling ignored; claim was already overtaken:', {
+                            eventId: row.id,
+                            claimToken,
+                        });
+                    } else {
+                        this.options.logger?.warn('[OutboxRelay] Transient publish error; rescheduled event with backoff:', {
+                            id: row.id,
+                            nextAttempts,
+                            backoffSeconds,
+                        });
+                    }
                 }
             }
         }

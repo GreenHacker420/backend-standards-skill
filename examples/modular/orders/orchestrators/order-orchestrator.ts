@@ -1,33 +1,62 @@
 import crypto from 'node:crypto';
-import { CreateOrderInput, OrderResponse } from '../schemas/order.schema';
-
-export interface OrderExecutionContext {
-  readonly organizationId: number;
-  readonly customerId: string;
-  readonly traceId: string;
-}
+import { CreateOrderInput } from '../schemas/order.schema';
 
 export interface CatalogProduct {
-  readonly id: string;
-  readonly organizationId: number;
-  readonly name: string;
-  readonly priceCents: number;
-  readonly currency: string;
-  readonly isActive: boolean;
+  id: string;
+  organizationId: number;
+  name: string;
+  priceCents: number;
+  currency: string;
+  isActive: boolean;
 }
 
-export interface OrderPersistenceClient {
-  $transaction<T>(action: (tx: OrderTransactionClient) => Promise<T>): Promise<T>;
+export interface OrderExecutionContext {
+  organizationId: number;
+  customerId: string;
+  traceId: string;
+}
+
+export interface OrderResponse {
+  id: string;
+  organizationId: number;
+  customerId: string;
+  status: 'PENDING' | 'CONFIRMED' | 'REJECTED';
+  items: Array<{
+    productId: string;
+    quantity: number;
+    unitPriceCents: number;
+    lineTotalCents: number;
+  }>;
+  totalCents: number;
+  currency: string;
+  createdAt: string;
 }
 
 export interface OrderTransactionClient {
+  product: {
+    findMany(args: {
+      where: {
+        id: { in: string[] };
+        organizationId: number;
+        isActive: boolean;
+      };
+      select?: {
+        id: true;
+        organizationId: true;
+        name: true;
+        priceCents: true;
+        currency: true;
+        isActive: true;
+      };
+    }): Promise<CatalogProduct[]>;
+  };
   order: {
     create(args: {
       data: {
         id: string;
         organizationId: number;
         customerId: string;
-        status: 'PENDING';
+        status: string;
         totalCents: number;
         currency: string;
         createdAt: Date;
@@ -55,11 +84,140 @@ export interface OrderTransactionClient {
   };
 }
 
+export interface OrderPersistenceClient {
+  $transaction<R>(fn: (tx: OrderTransactionClient) => Promise<R>): Promise<R>;
+}
+
 /**
- * Mock Product Catalog Repository (authoritative database source of truth for stand-alone testing)
- * In production: queried via `tx.product.findMany({ where: { id: { in: productIds }, organizationId } })`
+ * Production Order Domain Orchestrator
+ * 
+ * Demonstrates the canonical domain workflow rules:
+ * 1. Zero Client-Trusted Pricing: Prices are resolved strictly from authoritative database catalog records inside tx.
+ * 2. Multi-Tenant Authorization: Products and customer contexts are verified against caller organization in SQL.
+ * 3. Arithmetic Safety: Quantities, line totals, and grand totals are checked for integer overflow.
+ * 4. Atomic Outbox Integration: Business records and outbox events commit together in a single ACID transaction.
+ * 5. Mandatory Persistence Client: Requires an authoritative persistence client to eliminate silent no-op risks.
  */
-const CATALOG_DB: Record<string, CatalogProduct> = {
+export class OrderOrchestrator {
+  constructor(private readonly prisma: OrderPersistenceClient) {}
+
+  public async createOrder(
+    input: CreateOrderInput,
+    ctx: OrderExecutionContext
+  ): Promise<OrderResponse> {
+    const { organizationId, customerId, traceId } = ctx;
+
+    return await this.prisma.$transaction(async (tx) => {
+      // 1. Authoritative Server-Side Product Price & Tenant Resolution
+      const productIds = input.items.map((i) => i.productId);
+      const products = await tx.product.findMany({
+        where: {
+          id: { in: productIds },
+          organizationId,
+          isActive: true,
+        },
+      });
+
+      const productMap = new Map(products.map((p) => [p.id, p]));
+
+      let calculatedTotalCents = 0;
+      const resolvedItems = [];
+
+      for (const item of input.items) {
+        const product = productMap.get(item.productId);
+
+        if (!product) {
+          throw new Error(`Product not found, inactive, or unavailable in organization ${organizationId}: ${item.productId}`);
+        }
+
+        if (product.organizationId !== organizationId) {
+          throw new Error(`Cross-tenant security violation: product ${item.productId} does not belong to organization ${organizationId}`);
+        }
+
+        if (product.currency.toUpperCase() !== input.currency.toUpperCase()) {
+          throw new Error(`Currency mismatch: product ${product.name} is priced in ${product.currency}, but order requested ${input.currency}`);
+        }
+
+        const lineTotalCents = item.quantity * product.priceCents;
+        if (!Number.isSafeInteger(lineTotalCents) || lineTotalCents < 0) {
+          throw new RangeError(`Line item total exceeds safe integer bounds for product: ${item.productId}`);
+        }
+
+        calculatedTotalCents += lineTotalCents;
+        if (!Number.isSafeInteger(calculatedTotalCents)) {
+          throw new RangeError('Order total amount exceeds safe integer arithmetic limits');
+        }
+
+        resolvedItems.push({
+          productId: product.id,
+          quantity: item.quantity,
+          unitPriceCents: product.priceCents,
+          lineTotalCents,
+        });
+      }
+
+      const orderId = crypto.randomUUID();
+      const now = new Date();
+
+      // 2. Insert Order & Line Items atomically
+      await tx.order.create({
+        data: {
+          id: orderId,
+          organizationId,
+          customerId,
+          status: 'PENDING',
+          totalCents: calculatedTotalCents,
+          currency: input.currency.toUpperCase(),
+          createdAt: now,
+          items: {
+            create: resolvedItems,
+          },
+        },
+      });
+
+      // 3. Atomically append outbox event in the SAME transaction
+      await tx.outboxEvent.create({
+        data: {
+          eventType: 'order.created',
+          payload: {
+            orderId,
+            organizationId,
+            customerId,
+            totalCents: calculatedTotalCents,
+            currency: input.currency.toUpperCase(),
+            traceId,
+          },
+          status: 'PENDING',
+          attempts: 0,
+          createdAt: now,
+        },
+      });
+
+      return {
+        id: orderId,
+        organizationId,
+        customerId,
+        status: 'PENDING',
+        items: resolvedItems,
+        totalCents: calculatedTotalCents,
+        currency: input.currency.toUpperCase(),
+        createdAt: now.toISOString(),
+      };
+    });
+  }
+}
+
+/**
+ * Factory function for creating an OrderOrchestrator instance.
+ */
+export function createOrderOrchestrator(prisma: OrderPersistenceClient): OrderOrchestrator {
+  return new OrderOrchestrator(prisma);
+}
+
+/**
+ * In-Memory Mock Persistence Client for Unit Testing & Standalone Verification
+ */
+export const MOCK_CATALOG_FIXTURE: Record<string, CatalogProduct> = {
   'a0000000-0000-4000-8000-000000000001': {
     id: 'a0000000-0000-4000-8000-000000000001',
     organizationId: 1,
@@ -78,118 +236,34 @@ const CATALOG_DB: Record<string, CatalogProduct> = {
   },
 };
 
-/**
- * Production Order Domain Orchestrator
- * 
- * Demonstrates the canonical domain workflow rules:
- * 1. Zero Client-Trusted Pricing: Prices are resolved strictly from authoritative database catalog records.
- * 2. Multi-Tenant Authorization: Products and customer contexts are verified against caller organization.
- * 3. Arithmetic Safety: Quantities, line totals, and grand totals are checked for integer overflow.
- * 4. Atomic Outbox Integration: Business records and outbox events commit together in a single ACID transaction.
- */
-export class OrderOrchestrator {
-  constructor(private readonly prisma?: OrderPersistenceClient) {}
-
-  public async createOrder(
-    input: CreateOrderInput,
-    ctx: OrderExecutionContext
-  ): Promise<OrderResponse> {
-    const { organizationId, customerId, traceId } = ctx;
-
-    // 1. Authoritative Server-Side Product Price Resolution
-    let calculatedTotalCents = 0;
-    const resolvedItems = [];
-
-    for (const item of input.items) {
-      const product = CATALOG_DB[item.productId];
-
-      if (!product) {
-        throw new Error(`Product not found or unavailable in this organization: ${item.productId}`);
-      }
-
-      if (!product.isActive) {
-        throw new Error(`Product is currently inactive: ${product.name}`);
-      }
-
-      if (product.organizationId !== organizationId) {
-        throw new Error(`Cross-tenant security violation: product ${item.productId} does not belong to organization ${organizationId}`);
-      }
-
-      if (product.currency.toUpperCase() !== input.currency.toUpperCase()) {
-        throw new Error(`Currency mismatch: product ${product.name} is priced in ${product.currency}, but order requested ${input.currency}`);
-      }
-
-      const lineTotalCents = item.quantity * product.priceCents;
-      if (!Number.isSafeInteger(lineTotalCents) || lineTotalCents < 0) {
-        throw new RangeError(`Line item total exceeds safe integer bounds for product: ${item.productId}`);
-      }
-
-      calculatedTotalCents += lineTotalCents;
-      if (!Number.isSafeInteger(calculatedTotalCents)) {
-        throw new RangeError('Order total amount exceeds safe integer arithmetic limits');
-      }
-
-      resolvedItems.push({
-        productId: product.id,
-        quantity: item.quantity,
-        unitPriceCents: product.priceCents,
-        lineTotalCents,
-      });
-    }
-
-    const orderId = crypto.randomUUID();
-    const now = new Date();
-
-    // 2. Transactional Persistence & Atomic Outbox Event Emission
-    if (this.prisma) {
-      await this.prisma.$transaction(async (tx) => {
-        // Step A: Insert Order & Line Items
-        await tx.order.create({
-          data: {
-            id: orderId,
-            organizationId,
-            customerId,
-            status: 'PENDING',
-            totalCents: calculatedTotalCents,
-            currency: input.currency.toUpperCase(),
-            createdAt: now,
-            items: {
-              create: resolvedItems,
-            },
+export function createMockOrderPersistenceClient(
+  catalog: Record<string, CatalogProduct> = MOCK_CATALOG_FIXTURE
+): OrderPersistenceClient {
+  return {
+    async $transaction<R>(fn: (tx: OrderTransactionClient) => Promise<R>): Promise<R> {
+      const mockTx: OrderTransactionClient = {
+        product: {
+          async findMany(args) {
+            return Object.values(catalog).filter(
+              (p) =>
+                args.where.id.in.includes(p.id) &&
+                p.organizationId === args.where.organizationId &&
+                p.isActive === args.where.isActive
+            );
           },
-        });
-
-        // Step B: Atomically append outbox event in the SAME transaction
-        await tx.outboxEvent.create({
-          data: {
-            eventType: 'order.created',
-            payload: {
-              orderId,
-              organizationId,
-              customerId,
-              totalCents: calculatedTotalCents,
-              currency: input.currency.toUpperCase(),
-              traceId,
-            },
-            status: 'PENDING',
-            attempts: 0,
-            createdAt: now,
+        },
+        order: {
+          async create() {
+            return {};
           },
-        });
-      });
-    }
-
-    return {
-      id: orderId,
-      organizationId,
-      customerId,
-      status: 'PENDING',
-      items: resolvedItems,
-      totalCents: calculatedTotalCents,
-      currency: input.currency.toUpperCase(),
-      createdAt: now.toISOString(),
-    };
-  }
+        },
+        outboxEvent: {
+          async create() {
+            return {};
+          },
+        },
+      };
+      return fn(mockTx);
+    },
+  };
 }
-
-export const orderOrchestrator = new OrderOrchestrator();

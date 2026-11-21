@@ -181,22 +181,27 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
         if (req.currentOrganizationUser?.organizationId && req.currentOrganizationUser?.userId) {
             tenantScope = `org:${req.currentOrganizationUser.organizationId}:usr:${req.currentOrganizationUser.userId}`;
         } else {
+            // Unauthenticated requests MUST provide a cryptographically verified session token
+            if (!sessionValidator) {
+                res.status(500).json({
+                    error: true,
+                    message: 'Misconfigured idempotency: unauthenticated endpoints require a configured sessionValidator (e.g. HMAC-signed cookie or JWT) to prevent client-spoofed namespace collisions.',
+                });
+                return;
+            }
+
             const rawSessionToken = req.header('X-Client-Session-Id') ?? req.header('Authorization');
             const sessionParseResult = ClientSessionIdSchema.safeParse(rawSessionToken);
             if (!sessionParseResult.success) {
                 res.status(400).json({
                     error: true,
-                    message: 'Unauthenticated requests using Idempotency-Key must provide a verified session identity.',
+                    message: 'Unauthenticated requests using Idempotency-Key must provide a signed session identity in X-Client-Session-Id.',
                 });
                 return;
             }
 
-            // Verify session token via server signature if validator is configured
-            const verifiedSessionId = sessionValidator
-                ? sessionValidator(sessionParseResult.data)
-                : null;
-
-            if (sessionValidator && !verifiedSessionId) {
+            const verifiedSessionId = sessionValidator(sessionParseResult.data);
+            if (!verifiedSessionId) {
                 res.status(401).json({
                     error: true,
                     message: 'Invalid or forged session identity for unauthenticated idempotency key.',
@@ -204,7 +209,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                 return;
             }
 
-            tenantScope = `session:${verifiedSessionId ?? sessionParseResult.data}`;
+            tenantScope = `session:${verifiedSessionId}`;
         }
 
         const routePath = req.baseUrl + (req.route?.path ?? req.path);
@@ -303,10 +308,24 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             //? Lease health tracker: tracks whether this request still securely holds the Redis lease
             let leaseHealthValid = true;
             let consecutiveHeartbeatFailures = 0;
+            const leaseStartTime = Date.now();
+            const maxHoldTimeoutMs = 120000; // 2 minutes hard limit for active lease renewal
 
             //? Heartbeat lease renewal: extends lease every pendingTtlSeconds / 3 while operation is running.
             const heartbeatIntervalMs = Math.max(1000, Math.floor((pendingTtlSeconds * 1000) / 3));
             let heartbeatTimer: NodeJS.Timeout | null = setInterval(async () => {
+                // Hard deadline guard: abort mutation if handler hangs indefinitely
+                if (Date.now() - leaseStartTime > maxHoldTimeoutMs) {
+                    leaseHealthValid = false;
+                    abortController.abort();
+                    stopHeartbeat();
+                    logger?.error('[Idempotency] Max lease duration exceeded; dispatched AbortSignal to cancel running operation.', {
+                        redisKey,
+                        maxHoldTimeoutMs,
+                    });
+                    return;
+                }
+
                 try {
                     const extended = await redis.eval(
                         EXTEND_LEASE_LUA,
@@ -318,9 +337,11 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                     if (extended === 1) {
                         consecutiveHeartbeatFailures = 0;
                     } else {
+                        // Key expired or was overtaken in Redis
                         leaseHealthValid = false;
+                        abortController.abort(); // Cancel the running operation immediately to prevent duplicate state corruption
                         stopHeartbeat();
-                        logger?.error('[Idempotency] Pending lease lost or overtaken by concurrent request.', {
+                        logger?.error('[Idempotency] Pending lease lost or overtaken in Redis; dispatched AbortSignal to cancel running operation.', {
                             redisKey,
                             ownerToken,
                         });
@@ -328,9 +349,11 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                 } catch (heartbeatErr) {
                     consecutiveHeartbeatFailures++;
                     if (consecutiveHeartbeatFailures >= 2) {
+                        // Repeated failures: cannot guarantee lease ownership
                         leaseHealthValid = false;
+                        abortController.abort(); // Cancel the running operation when lease can no longer be guaranteed
                         stopHeartbeat();
-                        logger?.error('[Idempotency] Repeated heartbeat extension failures; lease considered lost.', {
+                        logger?.error('[Idempotency] Repeated heartbeat extension failures; lease considered lost; dispatched AbortSignal.', {
                             redisKey,
                             consecutiveHeartbeatFailures,
                             heartbeatErr,
@@ -350,21 +373,33 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             };
 
             //? Disconnect Safety Invariant:
-            //? On client disconnect (!res.writableEnded), we abort the signal and STOP heartbeat renewal,
-            //? but we DO NOT immediately delete the Redis key!
-            //? Why: An arbitrary database mutation or un-instrumented handler may still be executing and commit
-            //? in the background. Immediate deletion would allow a concurrent client retry to acquire the key
-            //? and execute duplicate mutations!
-            //? Leaving the short pending lease to expire naturally prevents this race condition.
-            res.once('finish', () => stopHeartbeat());
-            res.once('close', () => {
+            //? On client disconnect (!res.writableEnded), we signal cooperative cancellation via abortController.abort().
+            //? We DO NOT immediately delete the Redis key!
+            //? Furthermore, if an ongoing handler requires a graceful abort/rollback period, we maintain
+            //? heartbeat renewal for a short bounded grace period (or until handler completes) so a concurrent retry
+            //? cannot acquire the lease while the database connection is still rolling back.
+            let disconnectGraceTimer: NodeJS.Timeout | null = null;
+
+            res.once('finish', () => {
+                if (disconnectGraceTimer) clearTimeout(disconnectGraceTimer);
                 stopHeartbeat();
+            });
+
+            res.once('close', () => {
                 if (!res.writableEnded && !isCompleted) {
                     abortController.abort();
-                    logger?.warn('[Idempotency] Client disconnected with mutation in flight. Halting lease heartbeat; pending lease retained until natural TTL expiration to prevent concurrent execution race.', {
+                    logger?.warn('[Idempotency] Client disconnected with mutation in flight. Dispatched AbortSignal; maintaining lease for graceful cancellation grace period.', {
                         redisKey,
                         ownerToken,
                     });
+
+                    // Allow a 5-second graceful abort/rollback window before terminating heartbeat
+                    disconnectGraceTimer = setTimeout(() => {
+                        stopHeartbeat();
+                    }, 5000);
+                    disconnectGraceTimer.unref();
+                } else {
+                    stopHeartbeat();
                 }
             });
 
@@ -382,6 +417,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             };
 
             const persistCompletion = async (statusCode: number, body: unknown): Promise<boolean> => {
+                if (disconnectGraceTimer) clearTimeout(disconnectGraceTimer);
                 stopHeartbeat();
                 isCompleted = true;
 
@@ -583,8 +619,14 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
     if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.length > 64) {
         throw new TypeError('[DbIdempotency] idempotencyKey must be a non-empty string <= 64 characters.');
     }
-    if (!requestFingerprint || typeof requestFingerprint !== 'string' || requestFingerprint.length !== 64) {
-        throw new TypeError('[DbIdempotency] requestFingerprint must be a 64-character hex string.');
+    if (!requestFingerprint || typeof requestFingerprint !== 'string' || !/^[a-f0-9]{64}$/i.test(requestFingerprint)) {
+        throw new TypeError('[DbIdempotency] requestFingerprint must be a 64-character hexadecimal SHA-256 string.');
+    }
+    if (!Number.isInteger(ttlMinutes) || ttlMinutes <= 0 || ttlMinutes > 525600) {
+        throw new RangeError('[DbIdempotency] ttlMinutes must be a positive integer <= 525600 (1 year).');
+    }
+    if (!Number.isInteger(transactionTimeoutMs) || transactionTimeoutMs < 100 || transactionTimeoutMs > 120000) {
+        throw new RangeError('[DbIdempotency] transactionTimeoutMs must be an integer between 100 and 120000ms.');
     }
 
     return prisma.$transaction(async (tx) => {

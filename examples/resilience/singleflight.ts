@@ -46,7 +46,11 @@ export class Singleflight {
         try {
           return await fn();
         } finally {
-          this.inFlight.delete(key);
+          // Race safety: only delete if the map entry still points to this exact execution promise.
+          // Protects against accidental removal if clear() occurred and a newer flight was registered.
+          if (this.inFlight.get(key) === flightPromise) {
+            this.inFlight.delete(key);
+          }
         }
       })();
 

@@ -1,4 +1,5 @@
 import { monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks';
+import v8 from 'node:v8';
 
 export interface LoggerInterface {
     warn(message: string, ...meta: unknown[]): void;
@@ -122,9 +123,10 @@ export class DegradationManager {
     public evaluateHealth(): void {
         const p99EventLoopDelayMs = this.histogram.percentile(99) / 1e6;
 
-        // Check memory saturation (heap usage ratio)
-        const mem = process.memoryUsage();
-        const heapUsageRatio = mem.heapTotal > 0 ? mem.heapUsed / mem.heapTotal : 0;
+        // Check true memory saturation against V8's configured max heap size limit
+        const heapStats = v8.getHeapStatistics();
+        const heapLimit = heapStats.heap_size_limit;
+        const heapUsageRatio = heapLimit > 0 ? heapStats.used_heap_size / heapLimit : 0;
 
         try {
             if (p99EventLoopDelayMs > 250 || heapUsageRatio > 0.95) {
