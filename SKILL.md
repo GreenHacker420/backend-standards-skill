@@ -63,6 +63,11 @@ When authoring backend code, adhere strictly to these core principles:
 22. **Retry Budgets & Preventing Retry Storms**: Enforce a token bucket retry budget (max 10% retries) with Full Jitter backoff and strict transient vs terminal error classification to prevent retry storms.
 23. **Dead Letter Queue (DLQ) & Poison Pill Quarantine**: Quarantine unprocessable queue messages after max attempts and provide administrative re-drive capabilities.
 24. **Singleflight (Cache Stampede Prevention)**: Coalesce concurrent in-flight requests for identical keys to protect downstream databases from thundering herds.
+25. **Parse, Don't Validate & Smart Constructors**: Parse raw input at system boundaries into branded types (`Email`, `UserId`, `Money`) that cannot exist in an invalid state. Internal services must never defensively re-validate.
+26. **Make Illegal States Unrepresentable**: Model domain entities as state-discriminated unions rather than single objects with dozens of optional properties (`status: 'pending' | 'paid'`).
+27. **The Result Pattern for Expected Business Failures**: Return `{ ok: true, data } | { ok: false, error }` instead of throwing exceptions for predictable domain errors (`CouponExpired`, `InsufficientBalance`).
+28. **Prisma Type Extraction (Zero `as any`)**: Use `satisfies Prisma.<Model>Select` and `Prisma.<Model>GetPayload` to extract the exact return types of database queries without type assertions.
+29. **The Single Options Object Pattern**: Wrap function arguments in a single `readonly options: { ... }` object to prevent accidental parameter swapping bugs.
 
 ---
 
@@ -796,7 +801,149 @@ declare global {
 
 ---
 
-## 9. Zero-Hardcoding: Database as the Sole Source of Truth
+## 9. Advanced Domain Modeling & Extreme Type Safety Standards
+
+### A. "Parse, Don't Validate" & Branded Types
+Never pass raw primitives (`string`, `number`) through deep service layers after performing a boolean check. Parse inputs at system boundaries into branded types that cannot exist in an invalid state:
+
+```typescript
+// src/shared/types/branded.ts
+declare const __brand: unique symbol;
+export type Brand<K, T> = K & { readonly [__brand]: T };
+
+export type UserId = Brand<number, 'UserId'>;
+export type OrderId = Brand<number, 'OrderId'>;
+export type Email = Brand<string, 'Email'>;
+
+export function parseEmail(raw: unknown): Result<Email, 'INVALID_EMAIL_FORMAT'> {
+    if (typeof raw !== 'string') return fail('INVALID_EMAIL_FORMAT');
+    const trimmed = raw.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return fail('INVALID_EMAIL_FORMAT');
+    return ok(trimmed as Email);
+}
+```
+
+### B. Make Illegal States Unrepresentable
+Never model multi-phase domain objects as a single interface with dozens of optional properties (`paidAt?`, `refundedAt?`, `cancelReason?`). Model them as **State-Discriminated Unions**:
+
+```typescript
+export interface BaseOrder {
+    readonly id: string;
+    readonly createdAt: Date;
+    readonly totalCents: number;
+}
+
+export type PendingOrder = BaseOrder & {
+    readonly status: 'PENDING';
+    readonly paymentDueAt: Date;
+};
+
+export type PaidOrder = BaseOrder & {
+    readonly status: 'PAID';
+    readonly paidAt: Date;
+    readonly transactionId: string;
+};
+
+export type CancelledOrder = BaseOrder & {
+    readonly status: 'CANCELLED';
+    readonly cancelledAt: Date;
+    readonly cancelReason: string;
+};
+
+export type Order = PendingOrder | PaidOrder | CancelledOrder;
+```
+
+### C. Smart Constructors & Value Objects
+Primitives like `number` for currency or `Date` for intervals allow invalid states (e.g. negative prices, float rounding bugs). Use private constructors and static `.create(...)` factory methods:
+
+```typescript
+// See examples/types/smart-constructors.ts
+export class Money {
+    private constructor(
+        public readonly amountCents: number,
+        public readonly currency: 'USD' | 'EUR' | 'GBP' | 'INR'
+    ) {}
+
+    public static create(amountCents: number, currency: 'USD' | 'EUR' | 'GBP' | 'INR'): Result<Money, string> {
+        if (!Number.isInteger(amountCents)) return fail('Amount must be integer cents');
+        if (amountCents < 0) return fail('Amount cannot be negative');
+        return ok(new Money(amountCents, currency));
+    }
+
+    public add(other: Money): Result<Money, string> {
+        if (this.currency !== other.currency) return fail(`Currency mismatch`);
+        return ok(new Money(this.amountCents + other.amountCents, this.currency));
+    }
+}
+```
+
+### D. Exhaustive Pattern Matching with `assertNever`
+Always include `assertNever` in switch default blocks so adding a new state or event variant causes a compile-time failure:
+
+```typescript
+export function assertNever(value: never, message = 'Unhandled union member'): never {
+    throw new Error(`${message}: ${JSON.stringify(value)}`);
+}
+
+export function handleOrderState(order: Order) {
+    switch (order.status) {
+        case 'PENDING': return handlePending(order);
+        case 'PAID': return handlePaid(order);
+        case 'CANCELLED': return handleCancelled(order);
+        default:
+            return assertNever(order); // Compiler fails if any variant is unhandled!
+    }
+}
+```
+
+### E. Precise Prisma Type Extraction (Zero `as any`)
+Use `satisfies Prisma.<Model>Select` and `Prisma.<Model>GetPayload` to extract the exact return types of database queries without type assertions:
+
+```typescript
+// See examples/types/prisma-projections.ts
+export const userWithOrgSelect = {
+    id: true,
+    email: true,
+    firstName: true,
+    organization: { select: { id: true, codeName: true, timezone: true } },
+} as const satisfies Prisma.OrganizationUserSelect;
+
+export type UserWithOrgDTO = Prisma.OrganizationUserGetPayload<{ select: typeof userWithOrgSelect }>;
+```
+
+### F. The Result Pattern for Predictable Business Failures
+Throwing exceptions for expected domain states (`CouponExpired`, `InsufficientFunds`) breaks type safety and degrades V8 runtime performance. Return typed Result objects:
+
+```typescript
+// See examples/types/result.ts
+export type Result<T, E = Error> =
+    | { readonly ok: true; readonly data: T }
+    | { readonly ok: false; readonly error: E };
+
+export const ok = <T>(data: T): Result<T, never> => ({ ok: true, data });
+export const fail = <E>(error: E): Result<never, E> => ({ ok: false, error });
+```
+
+### G. The Single Options Object Rule
+Never declare functions with multiple positional parameters of the same primitive type (`fn(id1, id2, str1, bool)`). Wrap all arguments in a single `readonly options: { ... }` object:
+
+```typescript
+export interface TransferTicketOptions {
+    readonly ticketId: number;
+    readonly targetUserId: number;
+    readonly departmentId: number;
+    readonly notifyCustomer?: boolean;
+}
+
+export async function transferTicket(options: TransferTicketOptions): Promise<Ticket> {
+    const { ticketId, targetUserId, departmentId, notifyCustomer = false } = options;
+    // ...
+}
+```
+
+---
+
+## 10. Zero-Hardcoding: Database as the Sole Source of Truth
 
 Never embed business parameters, tenant permissions, or pricing caps directly in application code.
 
@@ -807,7 +954,7 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 
 ---
 
-## 10. Agent Checklist & Anti-Patterns to Avoid
+## 11. Agent Checklist & Anti-Patterns to Avoid
 
 ### ✅ DOs:
 - **Do** wrap every asynchronous controller in `try { ... } catch (error) { next(error); }`.
@@ -833,6 +980,12 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Do** quarantine poison pill payloads into a Dead Letter Queue (DLQ) with metadata.
 - **Do** use Singleflight promise coalescing to prevent cache stampedes on hot keys.
 - **Do** propagate request cancellations (`req.on('close')`) to abort downstream database queries when clients disconnect.
+- **Do** parse raw inputs into Branded Types (`Email`, `UserId`) at system boundaries ("Parse, Don't Validate").
+- **Do** model domain states as Discriminated Unions so impossible states cannot compile.
+- **Do** wrap function arguments in a single `readonly options: { ... }` object to prevent parameter swapping bugs.
+- **Do** use `satisfies Prisma.Select` and `Prisma.GetPayload` to extract database DTOs with zero `as any`.
+- **Do** return `Result<T, DomainError>` for predictable business failures instead of throwing exceptions.
+- **Do** use `assertNever(x)` in `default:` branches of switch statements for exhaustive compile-time verification.
 
 ### ❌ DON'Ts:
 - **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
@@ -841,7 +994,10 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Never** retry without an Idempotency-Key on non-idempotent mutations.
 - **Never** retry without jitter or beyond the 10% retry budget.
 - **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
-- **Never** perform dual writes (e.g. updating Postgres then publishing directly to Kafka/Rabbit/BullMQ without an outbox).
+- **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
+- **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
+- **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.
+- **Never** create "kitchen-sink" interfaces with dozens of optional fields (`paidAt?`, `refundedAt?`) when state is mutually exclusive.
 - **Never** leave floating promises un-awaited or without a `.catch()` handler.
 - **Never** swallow errors silently (`catch (e) {}`) without logging or proper handling.
 - **Never** retry permanent client errors (HTTP 400, 401, 403, 404, 422).

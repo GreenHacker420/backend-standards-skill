@@ -81,6 +81,10 @@ This repository codifies the architectural discipline to eliminate these problem
 9. **Tail-Based Tracing**: Buffer in-flight spans and sample 100% of errors and p99 latency spikes while downsampling healthy fast paths.
 10. **Retry Storm Prevention (Retry Budgets)**: Enforce a rolling token bucket (max 10% retries) with Full Jitter to avoid compounding outages.
 11. **Singleflight (Cache Stampede Prevention)**: Coalesce concurrent cache-miss requests into a single database promise.
+12. **"Parse, Don't Validate" & Branded Types**: Transform untrusted input into nominal branded types (`Email`, `UserId`) at API boundaries; eliminate repetitive defensive checks.
+13. **Make Illegal States Unrepresentable**: Model domain lifecycle phases as state-discriminated unions so impossible combinations cannot compile.
+14. **The Result Pattern**: Return `{ ok: true, data } | { ok: false, error }` for domain errors instead of throwing unchecked exceptions.
+15. **Type-Safe Prisma Projections (Zero `as any`)**: Enforce exact SQL projection contracts with `satisfies Prisma.Select` and `Prisma.GetPayload`.
 
 ---
 
@@ -95,6 +99,7 @@ This repository codifies the architectural discipline to eliminate these problem
 │   ├── orchestrators/             # Domain orchestrators decoupled from HTTP transport
 │   ├── observability/             # AsyncLocalStorage request context, tracing, tail-sampler, logger
 │   ├── resilience/                # Retry budget, singleflight, degradation manager, circuit breaker
+│   ├── types/                     # Branded types, smart constructors, result pattern, prisma projections
 │   └── database/                  # Bulkheaded Prisma pools, transactional outbox relay
 ├── references/                    # Deep architectural design specifications
 │   ├── 01-service-criticality-and-load-shedding.md
@@ -103,7 +108,9 @@ This repository codifies the architectural discipline to eliminate these problem
 │   ├── 04-error-handling-and-retries.md
 │   ├── 05-modular-vertical-slice-architecture.md
 │   ├── 06-tail-sampling-and-advanced-tracing.md
-│   └── 07-failure-recovery-retry-budgets-dlq.md
+│   ├── 07-failure-recovery-retry-budgets-dlq.md
+│   ├── 08-parse-dont-validate-and-domain-types.md
+│   └── 09-result-pattern-and-prisma-types.md
 └── package.json
 ```
 
