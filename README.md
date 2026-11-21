@@ -107,6 +107,10 @@ Parse untrusted inputs at system boundaries, use branded types and smart constru
 
 Separate transport concerns from business workflows. A route/action handler should generally parse input, enforce boundary concerns, call the relevant domain operation, and format the response. Use roughly 65 lines as an advisory review threshold, not a hard cap; longer handlers should be examined for misplaced responsibilities and simplified when that improves clarity.
 
+### 8. Treat security and resource limits as design constraints
+
+Use timing-safe comparisons for secrets, backpressure for large data pipelines, transaction-scoped locks for database coordination where appropriate, and cost-aware limits for expensive operations. Choose each control based on the threat or resource-exhaustion scenario it is meant to address.
+
 ---
 
 ## Architecture at a Glance
@@ -252,6 +256,9 @@ Do not introduce patterns that do not solve a demonstrated problem.
 
 ```text
 .
+├── .gitignore
+├── LICENSE
+├── README.md
 ├── SKILL.md
 ├── examples/
 │   ├── clean-code/
@@ -262,19 +269,20 @@ Do not introduce patterns that do not solve a demonstrated problem.
 │   ├── observability/
 │   ├── orchestrators/
 │   ├── resilience/
+│   ├── safety/
 │   └── types/
-├── references/
-│   ├── 01-service-criticality-and-load-shedding.md
-│   ├── 02-distributed-tracing-and-observability.md
-│   ├── 03-zero-hardcoding-database-rules.md
-│   ├── 04-error-handling-and-retries.md
-│   ├── 05-modular-vertical-slice-architecture.md
-│   ├── 06-tail-sampling-and-advanced-tracing.md
-│   ├── 07-failure-recovery-retry-budgets-dlq.md
-│   ├── 08-parse-dont-validate-and-domain-types.md
-│   ├── 09-result-pattern-and-prisma-types.md
-│   └── 10-commenting-clean-code-and-readability.md
-└── package.json
+└── references/
+    ├── 01-service-criticality-and-load-shedding.md
+    ├── 02-distributed-tracing-and-observability.md
+    ├── 03-zero-hardcoding-database-rules.md
+    ├── 04-error-handling-and-retries.md
+    ├── 05-modular-vertical-slice-architecture.md
+    ├── 06-tail-sampling-and-advanced-tracing.md
+    ├── 07-failure-recovery-retry-budgets-dlq.md
+    ├── 08-parse-dont-validate-and-domain-types.md
+    ├── 09-result-pattern-and-prisma-types.md
+    ├── 10-commenting-clean-code-and-readability.md
+    └── 11-production-safety-code-patterns.md
 ```
 
 ### Reference guide
@@ -291,6 +299,7 @@ Do not introduce patterns that do not solve a demonstrated problem.
 | [08 — Domain types and parse-don't-validate](./references/08-parse-dont-validate-and-domain-types.md) | Branded types, smart constructors, discriminated unions |
 | [09 — Result pattern and Prisma types](./references/09-result-pattern-and-prisma-types.md) | Typed domain failures and precise Prisma projections |
 | [10 — Clean code and commenting](./references/10-commenting-clean-code-and-readability.md) | Guard clauses, semantic comments, SLAP, readable handlers |
+| [11 — Production safety code patterns](./references/11-production-safety-code-patterns.md) | Timing-safe comparisons, backpressured streams, PostgreSQL advisory locks, cost-weighted rate limiting |
 
 ### Example guide
 
@@ -303,6 +312,7 @@ Do not introduce patterns that do not solve a demonstrated problem.
 | [observability](./examples/observability/) | Request context, tracing middleware, tail sampler |
 | [orchestrators](./examples/orchestrators/) | Domain workflow separated from the HTTP layer |
 | [resilience](./examples/resilience/) | Circuit breaker, retries, retry budgets, idempotency, singleflight, degradation |
+| [safety](./examples/safety/) | Timing-safe HMAC comparison, streaming pipelines, advisory locks, cost-weighted rate limiting |
 | [types](./examples/types/) | Branded types, smart constructors, Result, Prisma projections |
 
 Examples are intentionally focused. Review imports, framework versions, configuration, error semantics, transaction boundaries, and security controls before using them in an application.
