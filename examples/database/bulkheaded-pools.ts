@@ -1,5 +1,8 @@
 import { PrismaClient } from '@prisma/client';
 
+//? Import validated environment configuration from @/env (never raw process.env)
+import { env } from '@/env';
+
 /**
  * Bulkheaded Prisma connection pools:
  * Isolates critical revenue paths (Tier 0 Checkout/Payments) from non-critical enrichment (Tier 2 Recommendations).
@@ -13,12 +16,12 @@ export class BulkheadedDatabase {
 
     constructor() {
         this.criticalPool = new PrismaClient({
-            datasourceUrl: process.env.DATABASE_URL_PRIMARY,
+            datasourceUrl: env.DATABASE_URL_PRIMARY,
             log: ['error', 'warn'],
         });
 
         this.readReplicaPool = new PrismaClient({
-            datasourceUrl: process.env.DATABASE_URL_REPLICA || process.env.DATABASE_URL_PRIMARY,
+            datasourceUrl: env.DATABASE_URL_REPLICA ?? env.DATABASE_URL_PRIMARY,
             log: ['error'],
         });
     }

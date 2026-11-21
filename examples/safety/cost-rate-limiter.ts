@@ -5,24 +5,31 @@ export interface RedisClient {
   expire(key: string, seconds: number): Promise<number>;
 }
 
+export interface CostRateLimiterOptions {
+  windowSeconds: number;
+  maxPoints: number;
+  costCalculator?: (req: Request) => number;
+}
+
 /**
  * Cost-Weighted Rate Limiting Middleware
  * Protects CPU-heavy endpoints (e.g. PDF generation, embeddings, large exports)
  * by charging higher point costs against client quotas.
+ * 
+ * Usage:
+ * const limiter = createCostRateLimiter(redis);
+ * router.post('/export/pdf', limiter({ windowSeconds: 60, maxPoints: 100, costCalculator: () => 25 }), exportPdf);
  */
 export function createCostRateLimiter(redis: RedisClient) {
-  return function rateLimit(options: {
-    windowSeconds: number;
-    maxPoints: number;
-    costCalculator?: (req: Request) => number;
-  }) {
+  return function rateLimit(options: CostRateLimiterOptions) {
     const { windowSeconds, maxPoints, costCalculator = () => 1 } = options;
 
     return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
       const cost = Math.max(1, costCalculator(req));
-      const clientKey = (req as any).currentOrganizationUser
-        ? `ratelimit:org:${(req as any).currentOrganizationUser.organizationId}`
-        : `ratelimit:ip:${req.ip}`;
+      const orgId = req.currentOrganizationUser?.organizationId;
+      const clientKey = orgId
+        ? `ratelimit:org:${orgId}`
+        : `ratelimit:ip:${req.ip || 'unknown'}`;
 
       const currentPoints = await redis.incrby(clientKey, cost);
       if (currentPoints === cost) {

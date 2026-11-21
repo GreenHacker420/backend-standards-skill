@@ -104,9 +104,9 @@ export async function executeWithRetryBudget<T>(
       }
 
       if (!budget.canRetry()) {
-        const error = new Error(`[RetryBudgetExhausted] Downstream under load. Max retry ratio exceeded.`);
-        (error as any).cause = err;
-        throw error;
+        throw new Error('[RetryBudgetExhausted] Downstream under load. Max retry ratio exceeded.', {
+          cause: err,
+        });
       }
 
       // Check for explicit Retry-After header

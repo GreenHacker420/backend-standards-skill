@@ -23,8 +23,8 @@ export default async function createTicketController(req: Request, res: Response
             });
         }
 
-        // 3. Guard Clause
-        const user = (req as any).currentOrganizationUser;
+        // 3. Guard Clause: fully typed via ambient declaration (zero `as any`)
+        const user = req.currentOrganizationUser;
         if (!user) {
             return res.status(401).json({ error: true, message: 'Unauthorized' });
         }

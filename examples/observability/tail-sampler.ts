@@ -13,7 +13,7 @@ export interface Span {
   durationMs?: number;
   statusCode?: number;
   error?: boolean;
-  attributes: Record<string, any>;
+  attributes: Record<string, unknown>;
 }
 
 export interface TailSamplingPolicy {

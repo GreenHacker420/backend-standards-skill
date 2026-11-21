@@ -12,7 +12,7 @@ This specification establishes a formal priority hierarchy and load shedding pro
 ### Tier 0: Vital / Revenue Operations
 - **Components**: Authentication, Cart Mutation, Checkout, Payment Capture, Order Confirmation.
 - **SLA**: 99.99% availability.
-- **Policy**: **Never shed.** Protected by dedicated database pool slices and priority reservation. Must have zero synchronous dependencies on lower-tier services.
+- **Policy**: **Capacity Reserved & Highest Priority.** Protected by dedicated database pool slices and priority reservation. Must have zero synchronous dependencies on lower-tier services. If primary database is fully saturated or impaired, Tier 0 employs graceful fallback (e.g., synchronous read with deferred asynchronous ledger sync) rather than unhandled crash.
 
 ### Tier 1: Core Product Browsing
 - **Components**: Product Catalog, Item Details, Inventory Availability.

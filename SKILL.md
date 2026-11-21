@@ -72,9 +72,11 @@ When authoring backend code, adhere strictly to these core principles:
 31. **Guard Clauses & Flat Code Hierarchy**: Eliminate deep nesting (arrow code) by validating pre-conditions early and returning immediately. Keep the happy path flat against the left margin.
 32. **Controller Size Heuristic & Zero Dead Code**: Keep controllers focused on transport concerns and delegate domain workflows to orchestrators. Roughly 65 lines is an advisory review threshold, not a hard cap; longer handlers should be reviewed for misplaced responsibilities and simplified when appropriate. Never commit commented-out zombie code; rely on Git history.
 33. **Timing-Safe Cryptographic Comparisons**: Never use `===` to verify HMAC webhook signatures or secret tokens. Always use `crypto.timingSafeEqual` over fixed-length Buffers to prevent timing side-channel attacks.
-34. **Backpressured Stream Pipelines (OOM Prevention)**: Never load large files, CSV imports, or media buffers entirely into memory with `fs.readFileSync`. Always use Node.js `stream.pipeline` with `Transform` streams.
-35. **Transaction-Bound PostgreSQL Advisory Locks**: Prefer `SELECT pg_advisory_xact_lock($1)` over fragile Redis mutexes for database operations; advisory locks automatically release on `COMMIT` or `ROLLBACK` even if the process crashes.
-36. **Cost-Weighted Abuse Prevention**: Enforce dynamic point costs on rate limiters so expensive operations (PDF generation, AI embeddings, large exports) consume 10x more quota than fast reads.
+34. **Backpressured Stream Pipelines (OOM Prevention)**: Never load large files, CSV imports, or media buffers entirely into memory with `fs.readFileSync`. Always use Node.js `stream.pipeline` with Async Generators or properly handled `Transform` streams.
+35. **Transaction-Bound PostgreSQL Advisory Locks**: Prefer `SELECT pg_advisory_xact_lock($1)` over fragile Redis mutexes for database mutations; advisory locks automatically release on `COMMIT` or `ROLLBACK` even if the process crashes.
+36. **Cost-Weighted Abuse Prevention**: Enforce dynamic point costs on rate limiters so expensive operations (PDF generation, AI embeddings, large exports) consume proportionally higher quota than fast reads.
+37. **Multi-Tenancy & Query-Level Isolation**: Protect against Insecure Direct Object Reference (IDOR) vulnerabilities by binding all database reads and writes to authenticated tenant IDs (`organizationId`) at the ORM/RLS level.
+38. **Optimistic Concurrency Control (OCC) & Isolation Levels**: Prevent lost updates and race conditions on high-concurrency mutations using version tokens (`version Int @default(0)`) or PostgreSQL `SERIALIZABLE` transactions.
 
 ---
 
@@ -174,6 +176,10 @@ src/
 2. **No Direct Cross-Module DB Queries**: Module A (`orders`) must **never** query Module B (`tickets`) database tables directly. Communicate via exported interfaces in `index.ts` or asynchronous outbox events.
 3. **Preserve Single-Action Controllers**: Inside `actions/`, each file exports a single endpoint handler. Never create bloated controller classes.
 
+### Architecture Selection Policy: Layered vs Modular Vertical Slices
+- **Choose Layered Architecture** (`src/controllers/<domain>/`, `src/lib/<domain>/`) when building focused microservices, single-domain services, or applications with fewer than 20 endpoints where domain boundaries are already enforced at the repository/service boundary.
+- **Choose Modular Vertical Slices** (`src/modules/<feature>/`) when building medium-to-large modular monoliths, multi-domain SaaS backends, or applications with 20+ endpoints where grouping by business feature maximizes cohesion and minimizes cross-layer file hunting.
+
 ---
 
 ---
@@ -186,7 +192,7 @@ High-throughput systems must protect vital transactions (checkout, payments, aut
 
 | Tier | Name | Workloads | Overload Behavior |
 | :--- | :--- | :--- | :--- |
-| **Tier 0** | **Vital / Revenue** | Auth, Cart, Checkout, Payments, Order State | **Never Shed.** Highest priority. Reserved connection pool. Protected by aggressive shedding of lower tiers. |
+| **Tier 0** | **Vital / Revenue** | Auth, Cart, Checkout, Payments, Order State | **Capacity Reserved & Highest Priority.** Never shed under normal or elevated load. Protected by aggressive shedding of lower tiers. Under catastrophic database degradation, gracefully degrades to queued/read-only mode. |
 | **Tier 1** | **Core Experience** | Product details, catalog browsing, inventory read | **Degrade to Stale Cache.** Return cached data with extended TTLs. |
 | **Tier 2** | **Sheddable Enrichment** | Recommendations, personalization, related items, AI suggestions | **Shed First.** Under high load, disable dynamically or return static curated bestsellers (`degraded: true`). Zero DB queries. |
 | **Tier 3** | **Deferred / Background** | CSV exports, analytical reporting, marketing webhooks | **Hard Shed.** Return HTTP 503 with `Retry-After`; pause non-critical background queues. |
@@ -311,13 +317,32 @@ import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { requestContext, TraceContext } from '@/shared/classes/request-context';
 
-export function tracingMiddleware(req: Request, res: Response, next: NextFunction) {
-    const traceparent = req.header('traceparent');
-    const incomingTraceId = traceparent ? traceparent.split('-')[1] : req.header('x-trace-id');
-    const incomingRequestId = req.header('x-request-id');
+const W3C_TRACEPARENT_REGEX = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
+const SAFE_ID_REGEX = /^[a-zA-Z0-9_-]{16,64}$/;
 
-    const traceId = incomingTraceId || uuidv4().replace(/-/g, '');
-    const requestId = incomingRequestId || uuidv4();
+function extractTraceId(req: Request): string {
+    const traceparent = req.header('traceparent');
+    if (traceparent) {
+        const match = W3C_TRACEPARENT_REGEX.exec(traceparent.trim());
+        if (match && match[1] !== '00000000000000000000000000000000') {
+            return match[1].toLowerCase();
+        }
+    }
+
+    const customTraceId = req.header('x-trace-id');
+    if (customTraceId && SAFE_ID_REGEX.test(customTraceId.trim())) {
+        return customTraceId.trim();
+    }
+
+    return uuidv4().replace(/-/g, '').toLowerCase();
+}
+
+export function tracingMiddleware(req: Request, res: Response, next: NextFunction) {
+    const traceId = extractTraceId(req);
+    const incomingRequestId = req.header('x-request-id');
+    const requestId = (incomingRequestId && SAFE_ID_REGEX.test(incomingRequestId.trim()))
+        ? incomingRequestId.trim()
+        : uuidv4();
     const startTime = Date.now();
 
     const context: TraceContext = { traceId, requestId, startTime };
@@ -334,6 +359,7 @@ Every log line automatically embeds `traceId`, `requestId`, `userId`, and `organ
 
 ```typescript
 import winston from 'winston';
+import { env } from '@/env';
 import { requestContext } from './classes/request-context';
 
 const traceFormat = winston.format((info) => {
@@ -348,7 +374,7 @@ const traceFormat = winston.format((info) => {
 });
 
 export const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || 'info',
+    level: env.LOG_LEVEL || 'info',
     format: winston.format.combine(
         traceFormat(),
         winston.format.timestamp(),
@@ -629,19 +655,29 @@ export async function getCachedProduct(productId: string) {
 ```
 
 ### Request Deadline & Cancellation Propagation
-If a client disconnects before a request finishes, abort downstream work immediately to free database locks:
+In modern Node.js (v16+), `req.on('close')` fires when the request payload finishes uploading, NOT when the client disconnects! Listening to `req.on('close')` prematurely aborts valid transactions.
+**Correct standard**: Listen to `res.on('close')` and verify `!res.writableEnded`.
+
 ```typescript
+// src/middlewares/cancellation.ts
+import { Request, Response, NextFunction } from 'express';
+
 export function cancellationMiddleware(req: Request, res: Response, next: NextFunction) {
     const ac = new AbortController();
-    req.on('close', () => {
+
+    res.on('close', () => {
+        //? Abort downstream operations only if the response did not complete cleanly
         if (!res.writableEnded) {
-            ac.abort(); // Signals database and external fetch clients to abort execution
+            ac.abort(new Error('Client disconnected before response completed'));
         }
     });
-    (req as any).abortSignal = ac.signal;
+
+    // Strictly typed via ambient Express.Locals augmentation (zero `as any`)
+    res.locals.abortSignal = ac.signal;
     next();
 }
 ```
+*Note: `AbortSignal` only cancels downstream HTTP clients (`fetch`, `axios`) and database drivers that explicitly consume `res.locals.abortSignal`. It does not magically abort uninstrumented SQL operations.*
 
 ---
 
@@ -651,26 +687,52 @@ export function cancellationMiddleware(req: Request, res: Response, next: NextFu
 ```typescript
 // src/middlewares/idempotency.ts
 import { Request, Response, NextFunction } from 'express';
+import crypto from 'node:crypto';
 import { getRedisConnection } from '@/utils/redisConnection';
 import { sendError } from '@/shared/standard-api-responses/send-error';
 
-export function idempotencyMiddleware(ttlSeconds = 86400) {
+function computePayloadHash(payload: unknown): string {
+    if (!payload || (typeof payload === 'object' && Object.keys(payload).length === 0)) {
+        return 'empty';
+    }
+    const serialized = JSON.stringify(payload, Object.keys(payload as object).sort());
+    return crypto.createHash('sha256').update(serialized).digest('hex');
+}
+
+export function idempotencyMiddleware(options: { ttlSeconds?: number; failClosed?: boolean } = {}) {
+    const { ttlSeconds = 86400, failClosed = true } = options;
+
     return async (req: Request, res: Response, next: NextFunction) => {
         const idempotencyKey = req.header('Idempotency-Key');
         if (!idempotencyKey) return next();
 
-        const orgId = req.currentOrganizationUser?.organizationId || 'public';
-        const redisKey = `idempotency:${orgId}:${idempotencyKey}`;
+        // 1. Scope prevents cross-route or cross-tenant key collisions
+        const orgId = req.currentOrganizationUser?.organizationId ?? 'public';
+        const userId = req.currentOrganizationUser?.userId ?? 'anon';
+        const method = req.method.toUpperCase();
+        const routePath = req.baseUrl + (req.route?.path ?? req.path);
+        const redisKey = `idempotency:${orgId}:${userId}:${method}:${routePath}:${idempotencyKey}`;
+        const currentFingerprint = computePayloadHash(req.body);
+
         const redis = getRedisConnection('cache');
 
         try {
-            const acquired = await redis.set(redisKey, JSON.stringify({ status: 'pending' }), 'EX', ttlSeconds, 'NX');
+            // 2. Atomic lock acquisition with pending status
+            const initialRecord = { status: 'pending', fingerprint: currentFingerprint };
+            const acquired = await redis.set(redisKey, JSON.stringify(initialRecord), 'EX', ttlSeconds, 'NX');
             
             if (!acquired) {
                 const existing = await redis.get(redisKey);
                 if (existing) {
                     const parsed = JSON.parse(existing);
-                    if (parsed.status === 'completed') {
+
+                    //! Conflict: Key reused with different payload parameters
+                    if (parsed.fingerprint !== currentFingerprint) {
+                        return sendError(res, 'Idempotency key reused with a different request payload.', 422);
+                    }
+
+                    if (parsed.status === 'completed' && parsed.httpCode) {
+                        res.setHeader('X-Cache-Lookup', 'HIT - Idempotent Replay');
                         return res.status(parsed.httpCode).json(parsed.body);
                     }
                     if (parsed.status === 'pending') {
@@ -679,28 +741,53 @@ export function idempotencyMiddleware(ttlSeconds = 86400) {
                 }
             }
 
+            // 3. Intercept and AWAIT persistence before sending HTTP response
             const originalJson = res.json.bind(res);
-            res.json = (body: any) => {
-                if (res.statusCode >= 200 && res.statusCode < 300) {
-                    redis.set(
-                        redisKey,
-                        JSON.stringify({ status: 'completed', httpCode: res.statusCode, body }),
-                        'EX',
-                        ttlSeconds,
-                    ).catch(() => null);
-                } else {
-                    redis.del(redisKey).catch(() => null);
+            const originalSend = res.send.bind(res);
+
+            const persistResponse = async (statusCode: number, body: unknown) => {
+                try {
+                    if (statusCode >= 200 && statusCode < 300) {
+                        await redis.set(
+                            redisKey,
+                            JSON.stringify({ status: 'completed', httpCode: statusCode, fingerprint: currentFingerprint, body }),
+                            'EX',
+                            ttlSeconds,
+                        );
+                    } else {
+                        await redis.del(redisKey);
+                    }
+                } catch (persistErr) {
+                    logger.error('[Idempotency] Failed to persist completion state:', persistErr);
                 }
-                return originalJson(body);
+            };
+
+            res.json = (body: unknown): Response => {
+                void persistResponse(res.statusCode, body).then(() => {
+                    originalJson(body);
+                });
+                return res;
+            };
+
+            res.send = (body: unknown): Response => {
+                void persistResponse(res.statusCode, body).then(() => {
+                    originalSend(body);
+                });
+                return res;
             };
 
             next();
         } catch (err) {
+            //! Financial safety: fail-closed to prevent duplicate mutations during cache downtime
+            if (failClosed) {
+                return sendError(res, 'Idempotency service temporarily unavailable. Transaction aborted.', 503);
+            }
             next();
         }
     };
 }
 ```
+*For high-value financial transactions, prefer a durable PostgreSQL database-backed `idempotency_keys` table with a unique constraint on `(tenant_id, scope, idempotency_key)` and transactional state transitions (`PENDING` $\to$ `COMPLETED`).*
 
 ### Pattern B: Transactional Outbox Pattern
 ```typescript
@@ -740,36 +827,46 @@ class ShutdownManager {
         return this.isShuttingDown;
     }
 
-    public register(httpServer: Server) {
+    public register(httpServer: Server, drainTimeoutMs = 15000) {
         const shutdown = async (signal: string) => {
             if (this.isShuttingDown) return;
             this.isShuttingDown = true;
 
-            logger.info(`Received ${signal}. Starting graceful shutdown...`);
+            logger.info(`Received ${signal}. Starting coordinated graceful shutdown...`);
 
-            // 1. Drain HTTP server
-            httpServer.close(() => logger.info('HTTP server closed. In-flight requests drained.'));
-
+            // Emergency safety timer
             const forceExitTimer = setTimeout(() => {
-                logger.error('Shutdown timed out. Forcing process exit.');
+                logger.error('Shutdown exceeded timeout. Forcing process exit.');
                 process.exit(1);
-            }, 15000);
+            }, drainTimeoutMs);
             forceExitTimer.unref();
 
             try {
-                // 2. Close BullMQ workers
+                // Step 1: Pause background queue consumers (preventing new job pickup)
+                await mqProcesses.pause();
+                logger.info('MQ queue consumers paused.');
+
+                // Step 2: Drain in-flight HTTP requests (PROMISE-AWAITED)
+                logger.info('Draining in-flight HTTP requests...');
+                await new Promise<void>((resolve, reject) => {
+                    httpServer.close((err) => (err ? reject(err) : resolve()));
+                });
+                logger.info('HTTP server closed. All in-flight requests drained.');
+
+                // Step 3: Complete or abort background workers
                 await mqProcesses.shutdown();
                 logger.info('MQ workers closed.');
 
-                // 3. Disconnect Database Pool
+                // Step 4: Disconnect Database connection pool (AFTER HTTP & workers are idle!)
                 const prisma = getPrisma();
                 await prisma.$disconnect();
-                logger.info('Prisma disconnected.');
+                logger.info('Database pool closed.');
 
-                // 4. Disconnect Redis
+                // Step 5: Disconnect Redis cache and pub/sub
                 if (global._redis_connection) await global._redis_connection.quit();
                 logger.info('Redis connections closed.');
 
+                clearTimeout(forceExitTimer);
                 process.exit(0);
             } catch (err) {
                 logger.error('Error during shutdown:', err);
@@ -777,8 +874,8 @@ class ShutdownManager {
             }
         };
 
-        process.on('SIGTERM', () => shutdown('SIGTERM'));
-        process.on('SIGINT', () => shutdown('SIGINT'));
+        process.on('SIGTERM', () => void shutdown('SIGTERM'));
+        process.on('SIGINT', () => void shutdown('SIGINT'));
     }
 }
 
@@ -989,14 +1086,17 @@ export async function transferTicket(options: TransferTicketOptions): Promise<Ti
 
 ---
 
-## 10. Zero-Hardcoding: Database as the Sole Source of Truth
+## 10. Separation of Concerns: Code, Secrets & Database State
 
-Never embed business parameters, tenant permissions, or pricing caps directly in application code.
+Never embed business parameters, tenant permissions, or pricing caps directly in application code, while strictly maintaining security and invariant boundaries:
 
-1. **User Permissions**: Dynamic RBAC evaluated against `ResourceAccess` and `ModuleResource` tables.
-2. **Feature Access & Quotas**: Computed via `FeatureAccess.check(subscription, 'feature_key', count)` against active `SubscriptionFeature` rows.
-3. **Notification Copy & Templates**: Stored in `NotificationTemplate` database rows so organizations can customize copy, branding, and placeholders without code changes.
-4. **Third-Party Credentials**: Stored per organization in encrypted database rows (`WhatsappIntegration`, `MailSender`, `ShopifySession`).
+1. **Immutable Invariants & Domain Rules (Code in Git)**: Business state-machine transitions, domain invariants, cryptographic routines, and input validation schemas belong in version-controlled TypeScript code (`src/modules/*/`). Core security logic must not be bypassed via unvetted database mutations.
+2. **Master Secrets & Infrastructure Credentials (KMS / Secret Vaults)**: Database credentials, master encryption keys, and third-party platform secrets must live in environment managers / AWS KMS / GCP Secret Manager and validate via `@/env` at boot. Master infrastructure keys must **never** be stored in application database rows.
+3. **Dynamic Business State & Tenant Settings (Database as Source of Truth)**:
+   - **User Permissions**: Dynamic RBAC evaluated against `ResourceAccess` and `ModuleResource` tables.
+   - **Feature Access & Quotas**: Computed via `FeatureAccess.check(subscription, 'feature_key', count)` against active `SubscriptionFeature` rows.
+   - **Notification Copy & Templates**: Stored in `NotificationTemplate` database rows so organizations can customize copy, branding, and placeholders without code changes.
+   - **Tenant-Level Integrations**: Stored per organization in encrypted database rows (`WhatsappIntegration`, `MailSender`, `ShopifySession`) using tenant-scoped encryption.
 
 ---
 
@@ -1007,7 +1107,7 @@ Never compare HMAC signatures or tokens with `===`. String comparison exits on t
 
 ```typescript
 // See examples/safety/timing-safe.ts
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 
 export function verifySignature(received: string, expected: string): boolean {
     const a = Buffer.from(received, 'utf8');
@@ -1018,24 +1118,25 @@ export function verifySignature(received: string, expected: string): boolean {
 ```
 
 ### B. Backpressured Stream Pipelines (OOM Prevention)
-Never load large CSVs, audio files, or PDF reports into memory via `fs.readFileSync` or accumulators (`records.push(row)`). An unbounded 50MB file expands in V8 memory and triggers `JavaScript heap out of memory`. Use `stream.pipeline` to enforce backpressure:
+Never load large CSVs, audio files, or PDF reports into memory via `fs.readFileSync` or accumulators (`records.push(row)`). An unbounded 50MB file expands in V8 memory and triggers `JavaScript heap out of memory`. Use `stream.pipeline` with Async Generators to enforce backpressure:
 
 ```typescript
 // See examples/safety/streaming-pipeline.ts
-import { pipeline } from 'stream/promises';
-import { Transform } from 'stream';
-import fs from 'fs';
+import { pipeline } from 'node:stream/promises';
+import fs from 'node:fs';
 
+async function* transformStage(source: AsyncIterable<Buffer>) {
+    for await (const chunk of source) {
+        const transformed = await processChunk(chunk.toString('utf8'));
+        yield Buffer.from(transformed, 'utf8');
+    }
+}
+
+// Automatically manages backpressure and safely closes file handles on error
 await pipeline(
-    fs.createReadStream(filePath),
-    new Transform({
-        objectMode: true,
-        async transform(chunk, enc, cb) {
-            await processChunk(chunk);
-            cb(); // Upstream disk reader pauses until this callback fires!
-        }
-    }),
-    destinationStream
+    fs.createReadStream(inputFilePath),
+    transformStage,
+    fs.createWriteStream(outputFilePath)
 );
 ```
 
@@ -1045,8 +1146,12 @@ Unlike Redis distributed locks (which risk becoming orphaned if a container cras
 ```typescript
 // See examples/safety/advisory-lock.ts
 await prisma.$transaction(async (tx) => {
-    // Locks this 64-bit ID for the duration of THIS transaction only
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${entityId})`;
+    // 1. Prevent indefinite lock queue starvation
+    await tx.$executeRaw`SET LOCAL lock_timeout = '5000ms'`;
+
+    // 2. Locks this 64-bit ID for THIS transaction only (via $queryRaw)
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(${BigInt(entityId)})`;
+
     await performSensitiveMutation(tx);
 });
 ```
@@ -1056,12 +1161,65 @@ Generic rate limiters (e.g. 100 req/min) leave backends vulnerable to CPU exhaus
 
 ```typescript
 // See examples/safety/cost-rate-limiter.ts
-router.post('/export/pdf', rateLimit({ maxPoints: 100, windowSeconds: 60 })((req) => 25), exportPdfAction);
+const limiter = createCostRateLimiter(redis);
+
+router.post(
+    '/export/pdf',
+    limiter({ windowSeconds: 60, maxPoints: 100, costCalculator: () => 25 }),
+    exportPdfAction
+);
 ```
 
 ---
 
-## 12. Agent Checklist & Anti-Patterns to Avoid
+## 12. Multi-Tenancy & Transactional Concurrency Control
+
+### Multi-Tenancy & Query Isolation (Preventing IDOR)
+Every query touching tenant-scoped tables must enforce tenant isolation at the infrastructure level. Use Prisma Client Extensions to automatically inject `organizationId` into every `where` clause:
+
+```typescript
+// See references/12-multi-tenancy-and-transactional-concurrency.md
+export function createTenantPrismaClient(basePrisma: PrismaClient, organizationId: number) {
+    return basePrisma.$extends({
+        query: {
+            $allModels: {
+                async findMany({ args, query }) {
+                    args.where = { ...args.where, organizationId };
+                    return query(args);
+                },
+                async findFirst({ args, query }) {
+                    args.where = { ...args.where, organizationId };
+                    return query(args);
+                },
+            },
+        },
+    });
+}
+```
+
+### Optimistic Concurrency Control (OCC)
+Prevent lost updates on inventory counts, wallet balances, and state machine transitions by maintaining a `version Int @default(0)` token:
+
+```typescript
+const updated = await prisma.order.updateMany({
+    where: {
+        id: orderId,
+        version: currentVersion, // Fails if another concurrent mutation incremented version
+    },
+    data: {
+        status: 'PAID',
+        version: { increment: 1 },
+    },
+});
+
+if (updated.count === 0) {
+    throw new ConcurrencyConflictError('Order was concurrently modified. Please refresh and retry.');
+}
+```
+
+---
+
+## 13. Agent Checklist & Anti-Patterns to Avoid
 
 ### ✅ DOs:
 - **Do** wrap every asynchronous controller in `try { ... } catch (error) { next(error); }`.
@@ -1072,7 +1230,8 @@ router.post('/export/pdf', rateLimit({ maxPoints: 100, windowSeconds: 60 })((req
 - **Do** support `Idempotency-Key` headers on state-modifying operations (payments, tickets, orders).
 - **Do** use the Transactional Outbox pattern when mutating database state that requires background events.
 - **Do** clean up temporary resources (files, buffers, locks) inside `finally` blocks.
-- **Do** retry transient errors (network timeouts, HTTP 429/502/503/504, DB deadlocks) using `withRetry`.
+- **Do** retry transient errors (network timeouts, HTTP 429/502/503/504, DB deadlocks) using `withRetry` with AWS Full Jitter.
+- **Do** honor `Retry-After` headers on rate limits before calculating backoff delays.
 - **Do** wrap flaky third-party integrations with a Circuit Breaker.
 - **Do** register graceful shutdown handlers (`SIGTERM`/`SIGINT`) to drain connections before exit.
 - **Do** create a single file for each controller endpoint (`src/controllers/<domain>/<action>.ts`).
@@ -1086,7 +1245,7 @@ router.post('/export/pdf', rateLimit({ maxPoints: 100, windowSeconds: 60 })((req
 - **Do** use Full Jitter for exponential backoff to avoid synchronized client retry waves.
 - **Do** quarantine poison pill payloads into a Dead Letter Queue (DLQ) with metadata.
 - **Do** use Singleflight promise coalescing to prevent cache stampedes on hot keys.
-- **Do** propagate request cancellations (`req.on('close')`) to abort downstream database queries when clients disconnect.
+- **Do** propagate request cancellations via `res.on('close')` (when `!res.writableEnded`) to abort downstream work when clients disconnect.
 - **Do** parse raw inputs into Branded Types (`Email`, `UserId`) at system boundaries ("Parse, Don't Validate").
 - **Do** model domain states as Discriminated Unions so impossible states cannot compile.
 - **Do** wrap function arguments in a single `readonly options: { ... }` object to prevent parameter swapping bugs.
@@ -1098,9 +1257,38 @@ router.post('/export/pdf', rateLimit({ maxPoints: 100, windowSeconds: 60 })((req
 - **Do** keep HTTP controllers focused on transport concerns; use roughly 65 lines as an advisory review signal and delegate domain logic to orchestrators.
 - **Do** prefix boolean variables with active predicates (`isValid`, `hasPermission`, `canRetry`).
 - **Do** use `crypto.timingSafeEqual` for all webhook signature and token comparisons.
-- **Do** process large files and CSVs using `stream.pipeline` and `Transform` streams to prevent heap OOM crashes.
+- **Do** process large files and CSVs using `stream.pipeline` and Async Generators to prevent heap OOM crashes.
 - **Do** use PostgreSQL transaction-level advisory locks (`pg_advisory_xact_lock`) for distributed database mutexes.
 - **Do** assign dynamic point costs to rate limiters on CPU-heavy endpoints (PDF, AI, exports).
+- **Do** scope all multi-tenant queries to `organizationId` at the ORM/RLS level to eliminate IDOR risks.
+- **Do** use Optimistic Concurrency Control (`version` token) to prevent lost updates on concurrent mutations.
+
+### ❌ DON'Ts:
+- **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
+- **Never** query another module's database tables directly in a modular architecture (use public module interfaces).
+- **Never** perform dual writes (e.g. updating Postgres then publishing directly to Kafka/Rabbit/BullMQ without an outbox).
+- **Never** retry without an Idempotency-Key on non-idempotent mutations.
+- **Never** retry without jitter or beyond the 10% retry budget.
+- **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
+- **Never** compare cryptographic signatures or tokens using standard `===` (vulnerable to timing attacks).
+- **Never** read entire large files into memory with `fs.readFileSync` or accumulate unbounded arrays.
+- **Never** rely on Redis distributed locks for operations that require ACID rollback guarantees.
+- **Never** write redundant comments that state the obvious (`// get user by id: await getUserById()`).
+- **Never** nest logic 3+ levels deep inside `if/else` ladders (arrow code anti-pattern).
+- **Never** commit commented-out zombie code (`// const oldLogic = ...`). Rely on Git history.
+- **Don't** let business workflows or persistence logic accumulate in controllers; review unusually long handlers and refactor when it improves clarity.
+- **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
+- **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
+- **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.
+- **Never** create "kitchen-sink" interfaces with dozens of optional fields (`paidAt?`, `refundedAt?`) when state is mutually exclusive.
+- **Never** leave floating promises un-awaited or without a `.catch()` handler.
+- **Never** swallow errors silently (`catch (e) {}`) without logging or proper handling.
+- **Never** retry permanent client errors (HTTP 400, 401, 403, 404, 422).
+- **Never** hardcode tenant quotas, feature flags, or permission rules in code. Query the DB.
+- **Never** use `(req as any)` to access user or session data. Update `src/typings/index.d.ts` instead.
+- **Never** return raw objects like `res.json({ foo: 'bar' })` or ad-hoc error formats.
+- **Never** perform business logic directly inside Express route files (`.routes.ts`).
+- **Never** read `process.env.*` directly throughout the codebase. Import from `@/env`.
 
 ### ❌ DON'Ts:
 - **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.

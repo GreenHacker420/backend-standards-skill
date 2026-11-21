@@ -13,7 +13,7 @@ export async function createOrderAction(
 ): Promise<void> {
   try {
     const validatedInput = createOrderSchema.parse(req.body);
-    const traceId = (req as any).traceId;
+    const traceId = req.traceId ?? 'unknown';
 
     const order = await orderOrchestrator.createOrder(validatedInput, traceId);
 

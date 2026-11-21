@@ -13,11 +13,14 @@
 
 ---
 
-## 2. Exponential Backoff with Jitter (`withRetry`)
-Retrying failing network operations at fixed intervals causes the "thundering herd" problem, overwhelming recovering downstream servers.
+## 2. Exponential Backoff with AWS Full Jitter (`withRetry`)
+Retrying failing network operations at fixed intervals or with additive jitter causes the "thundering herd" problem, synchronizing retries and overwhelming recovering downstream servers.
 
-### The Algorithm
-$$\text{delay} = \min(\text{maxDelay}, \text{minDelay} \times \text{factor}^{\text{attempt} - 1}) + \text{jitter}$$
+### The Algorithm: Full Jitter
+$$\text{ceiling} = \min(\text{maxDelay}, \text{minDelay} \times \text{factor}^{\text{attempt} - 1})$$
+$$\text{delay} = \text{random}(0, \text{ceiling})$$
 
-- **Transient Errors**: Network drops (`ECONNRESET`, `ETIMEDOUT`), HTTP 429, 502, 503, 504, and Postgres lock deadlocks (`40P01`). These are retried automatically.
+- **Honoring Upstream Headers**: If an HTTP 429 or 503 response includes a valid `Retry-After` header (in seconds or HTTP-date), the retry mechanism pauses for that exact duration instead of calculating jitter.
+- **Idempotent 500 Retries**: If the caller explicitly marks the operation as idempotent (`isIdempotent: true`), a single cautious retry is permitted on HTTP 500 Internal Server Error (to handle transient upstream web server restarts).
+- **Transient Errors**: Network drops (`ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `EAI_AGAIN`), HTTP 429, 502, 503, 504, and PostgreSQL deadlocks (`40P01`) / serialization failures (`40001`). These are retried automatically.
 - **Non-Transient Errors**: HTTP 400, 401, 403, 404, 422. These fail fast immediately.

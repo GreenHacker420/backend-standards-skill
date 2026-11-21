@@ -45,15 +45,18 @@ export async function createOrderAction(req: Request, res: Response): Promise<vo
     res.status(201).json({
       success: true,
       data: order,
-      meta: { traceId: (req as any).traceId }
+      meta: { traceId: req.traceId ?? 'unknown' }
     });
   } catch (error) {
-    req.logger.error('Order placement failed', { error });
+    req.logger?.error('Order placement failed', { error });
     res.status(500).json({ success: false, message: 'Internal Server Error' });
   }
 }
 
 // Mock orchestrator interface for reference
 const orderOrchestrator = {
-  placeOrder: async (input: any) => ({ id: 'ord_123', status: 'CONFIRMED' })
+  placeOrder: async (_input: { organizationId: number; userId: number; items: unknown[]; timezone?: string }) => ({
+    id: 'ord_123',
+    status: 'CONFIRMED'
+  })
 };

@@ -7,6 +7,15 @@ In traditional Layered Architecture, code is organized horizontally (`controller
 
 ---
 
+## Architectural Selection Policy
+
+| Architecture Style | Ideal Use Case | Pros | Trade-offs |
+| :--- | :--- | :--- | :--- |
+| **Layered / Domain-Grouped** (`src/controllers/<domain>/`, `src/lib/<domain>/`) | Focused microservices, single bounded context, < 20 endpoints | Extremely straightforward; rapid initial setup; simple mental model for small services. | Higher file scattering as codebase grows; requires discipline to avoid leaky cross-layer calls. |
+| **Modular Vertical Slices** (`src/modules/<feature>/`) | Medium-to-large modular monoliths, multi-domain SaaS, > 20 endpoints | Maximum feature cohesion; trivial to isolate dead features; clean bounded public contracts (`index.ts`). | Requires upfront architectural boundary definition; slight boilerplate duplication for independent schemas. |
+
+---
+
 ## Directory Blueprint
 
 ```

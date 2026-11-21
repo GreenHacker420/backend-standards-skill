@@ -282,7 +282,8 @@ Do not introduce patterns that do not solve a demonstrated problem.
     ├── 08-parse-dont-validate-and-domain-types.md
     ├── 09-result-pattern-and-prisma-types.md
     ├── 10-commenting-clean-code-and-readability.md
-    └── 11-production-safety-code-patterns.md
+    ├── 11-production-safety-code-patterns.md
+    └── 12-multi-tenancy-and-transactional-concurrency.md
 ```
 
 ### Reference guide
@@ -300,6 +301,7 @@ Do not introduce patterns that do not solve a demonstrated problem.
 | [09 — Result pattern and Prisma types](./references/09-result-pattern-and-prisma-types.md) | Typed domain failures and precise Prisma projections |
 | [10 — Clean code and commenting](./references/10-commenting-clean-code-and-readability.md) | Guard clauses, semantic comments, SLAP, readable handlers |
 | [11 — Production safety code patterns](./references/11-production-safety-code-patterns.md) | Timing-safe comparisons, backpressured streams, PostgreSQL advisory locks, cost-weighted rate limiting |
+| [12 — Multi-tenancy and transactional concurrency](./references/12-multi-tenancy-and-transactional-concurrency.md) | Multi-tenant query isolation, IDOR prevention, optimistic concurrency control (OCC), database isolation levels |
 
 ### Example guide
 
