@@ -40,7 +40,18 @@ This repository contains three complementary layers:
 | **Deep-dive references** | Focused explanations, trade-offs, and design guidance for major engineering topics | [references/](./references/) |
 | **Code examples** | Small TypeScript implementations illustrating selected patterns | [examples/](./examples/) |
 
-The skill is intended to help an AI coding agent understand the conventions of a backend project before it creates or modifies code. It can also serve as a human-readable engineering playbook for code review, architecture discussions, and onboarding.
+### How Agents & Engineers Should Interpret This Skill
+
+To avoid ambiguity, the standard distinguishes between three levels of authority:
+
+| Level | Meaning | Agent's Responsibility |
+| :--- | :--- | :--- |
+| **Mandatory Standards** | Security boundaries, transactional atomicity, concurrency invariants, and data-integrity guarantees | **Must follow strictly.** Never compromise correctness, ACID isolation, or safety invariants. |
+| **Architectural Recommendations** | Preferred structural patterns, domain orchestrators, modular vertical slices, and single-action decomposition | **Follow unless there is a justified reason not to** (e.g. existing conventions in an established project). |
+| **Examples & Reference Code** | Concrete illustrative implementations demonstrating the target patterns in code | **Understand the underlying invariant and adapt; do NOT blindly copy.** |
+
+> **Agent Execution Mandate:**
+> Examples demonstrate intended engineering principles and implementation approaches. They are not mandatory templates. Agents must understand the underlying invariant and apply it using the project's actual architecture, dependencies, and framework conventions. Do not introduce framework migrations, architectural overhauls, or new dependencies merely to match an example.
 
 ### What it is—and what it is not
 
@@ -54,13 +65,13 @@ The skill is intended to help an AI coding agent understand the conventions of a
 
 This skill is most useful for:
 
-- Engineers building Node.js services with TypeScript.
-- Teams using Express-style HTTP handlers, Prisma, PostgreSQL, Redis, and BullMQ.
+- Engineers building production Node.js services with TypeScript.
+- Teams designing reliable HTTP endpoints, PostgreSQL + Prisma data layers, and Redis + BullMQ asynchronous pipelines.
 - Developers designing modular monoliths or feature-oriented backend services.
-- Teams that use AI coding agents and want consistent architecture and coding conventions.
-- Reviewers who need a shared checklist for reliability, type safety, and maintainability.
+- Teams that use AI coding agents and want consistent architecture, reliability, and coding conventions.
+- Reviewers who need a shared checklist for reliability, concurrency correctness, type safety, and maintainability.
 
-The repository is opinionated and examples use a particular ecosystem. The principles can be adapted to other frameworks, databases, and queue providers, but the code samples may need changes.
+The repository is opinionated and examples are implemented using a concrete modern TypeScript stack (HTTP controllers, Prisma ORM, Redis, and BullMQ). The core reliability invariants (distributed claim leases, outbox fencing tokens, atomic rate limits, and constant-time crypto comparisons) apply across production backends, while the implementation patterns illustrate how to realize those invariants cleanly in TypeScript.
 
 ---
 

@@ -14,6 +14,22 @@ This skill prescribes the exact architectural conventions, coding patterns, comm
 
 ---
 
+## Instruction Semantics & Agent Interpretation
+
+AI coding agents using this skill must distinguish between three distinct levels of authority:
+
+| Level | Meaning | Agent's Responsibility |
+| :--- | :--- | :--- |
+| **Mandatory Standards** | Security boundaries, transactional atomicity, concurrency invariants, and data-integrity guarantees | **Must follow strictly.** Never compromise correctness, ACID isolation, or safety invariants. |
+| **Architectural Recommendations** | Preferred structural patterns, domain orchestrators, modular vertical slices, and single-action decomposition | **Follow unless there is a justified reason not to** (e.g. existing conventions in an established project). |
+| **Examples & Reference Code** | Concrete illustrative implementations demonstrating the target patterns in code | **Understand the underlying invariant and adapt; do NOT blindly copy.** |
+
+> [!IMPORTANT]
+> **Agent Execution Mandate:**
+> Examples demonstrate intended engineering principles and implementation approaches. They are not mandatory templates. Agents must understand the underlying invariant and apply it using the project's actual architecture, dependencies, and framework conventions. Do not introduce framework migrations, architectural overhauls, or new dependencies merely to match an example.
+
+---
+
 ## 1. Core Architectural Tenets
 
 When authoring backend code, adhere strictly to these core principles:
