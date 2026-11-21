@@ -105,7 +105,7 @@ Parse untrusted inputs at system boundaries, use branded types and smart constru
 
 ### 7. Keep handlers small and domain logic testable
 
-Separate transport concerns from business workflows. A route/action handler should generally parse input, enforce boundary concerns, call the relevant domain operation, and format the response. The 65-line guideline is a review heuristic—not a substitute for good decomposition.
+Separate transport concerns from business workflows. A route/action handler should generally parse input, enforce boundary concerns, call the relevant domain operation, and format the response. Use roughly 65 lines as an advisory review threshold, not a hard cap; longer handlers should be examined for misplaced responsibilities and simplified when that improves clarity.
 
 ---
 
@@ -181,12 +181,23 @@ The Skills CLI evolves independently of this repository. Check `npx skills add -
 
 The skill definition is [SKILL.md](./SKILL.md). Place it in the skill directory expected by your coding agent.
 
-For example, in a project-local agent skills directory:
+For example, to install into a separate project, clone the skill repository and copy both the skill definition and its examples into that project's skill directory:
 
 ```bash
-mkdir -p .agents/skills/backend
-cp SKILL.md .agents/skills/backend/SKILL.md
+# Clone the skill repository (use a path that does not already exist)
+git clone https://github.com/GreenHacker420/backend-standards-skill.git /tmp/backend-standards-skill
+
+# Set the absolute path to the project where you want to install the skill
+PROJECT_ROOT="/absolute/path/to/your-project"
+SKILL_SOURCE="/tmp/backend-standards-skill"
+SKILL_TARGET="$PROJECT_ROOT/.agents/skills/backend"
+
+mkdir -p "$SKILL_TARGET" "$SKILL_TARGET/examples"
+cp "$SKILL_SOURCE/SKILL.md" "$SKILL_TARGET/SKILL.md"
+cp -R "$SKILL_SOURCE/examples/." "$SKILL_TARGET/examples/"
 ```
+
+Replace `/absolute/path/to/your-project` with the target project's actual absolute path. Copying `examples/` alongside `SKILL.md` preserves the relative example paths referenced by the skill instructions.
 
 For a global Google Antigravity setup, use the skills directory configured by your installed Antigravity version. Directory conventions can change, so prefer its current documentation over assuming a path is universal.
 
@@ -435,4 +446,4 @@ Please avoid adding prescriptive rules without explaining the problem they solve
 
 ## License
 
-This project is licensed under the [MIT License](https://opensource.org/licenses/MIT). See the repository's license file or package metadata for the applicable terms.
+This project is licensed under the MIT License. See [LICENSE](./LICENSE) in the repository root for the complete license terms.
