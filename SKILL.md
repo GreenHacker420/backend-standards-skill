@@ -68,6 +68,9 @@ When authoring backend code, adhere strictly to these core principles:
 27. **The Result Pattern for Expected Business Failures**: Return `{ ok: true, data } | { ok: false, error }` instead of throwing exceptions for predictable domain errors (`CouponExpired`, `InsufficientBalance`).
 28. **Prisma Type Extraction (Zero `as any`)**: Use `satisfies Prisma.<Model>Select` and `Prisma.<Model>GetPayload` to extract the exact return types of database queries without type assertions.
 29. **The Single Options Object Pattern**: Wrap function arguments in a single `readonly options: { ... }` object to prevent accidental parameter swapping bugs.
+30. **Semantic Commenting Taxonomy (`Better Comments` Style)**: Comments must document *why*, never *what*. Use semantic tags (`//?` Rationale, `//!` Hazards/Invariants, `//*` Business Rules, `//&` Boundaries). Never state the obvious.
+31. **Guard Clauses & Flat Code Hierarchy**: Eliminate deep nesting (arrow code) by validating pre-conditions early and returning immediately. Keep the happy path flat against the left margin.
+32. **The 65-Line Controller Rule & Zero Dead Code**: Controllers must remain under 65 lines of code, delegating workflows to orchestrators. Never commit commented-out zombie code; rely on Git history.
 
 ---
 
@@ -399,17 +402,56 @@ export class TailSampler {
 
 ---
 
-## 5. Semantic Commenting Taxonomy (`Better Comments` Style)
+## 5. Semantic Commenting, Code Cleanliness & Readability Standards
 
+### A. The Golden Rule of Comments: Explain WHY, Never WHAT
+Code tells you *how* and *what*; comments must explain **why**.
+- **Never** state the obvious: `// get user by id: const user = await getUser(id);` is noise and tech debt.
+- **Always** document rationale, mathematical justification, non-obvious algorithms, vendor workarounds, or race condition mitigations.
+
+### B. Semantic Commenting Taxonomy (`Better Comments` Style)
 Use an intentional, color-coded visual commenting grammar across all files to make code self-documenting and immediately scannable:
 
-| Tag | Meaning | Purpose | Example |
-| :--- | :--- | :--- | :--- |
-| `//?` | **Information & Rationale** | Explains architectural intent, subtle behavior, or external links | `//? L1 in-memory check avoids Redis round-trip for high-frequency user pings` |
-| `//!` | **Critical Hazards & Invariants** | Warns of breaking changes, database risks, or third-party quirks | `//! Note: File must be uploaded with contentType, else WhatsApp rejects application/octet-stream` |
-| `//&` | **Domain Boundaries** | Visual separators for sub-modules, modules, or major routing groups | `//& Customer support module 📞 📧` |
-| `//*` | **Business Rule Constraints** | Specific business rules or time-window limitations | `//* Not sending followup messages outside 9 AM to 9 PM contact local time` |
-| `/** ... */` | **JSDoc Rationale** | Multi-line documentation on engineering decisions | Explain why PNG is used over SVG in email, or why custom Crockford alphabet was chosen |
+| Tag | Name | Color | Purpose & Usage | Real Example |
+| :--- | :--- | :--- | :--- | :--- |
+| `//?` | **Information & Rationale** | 🔵 Blue | Explains architectural intent, math formulas, or non-obvious algorithms. | `//? Each GPT query is counted as 2 interactions because it includes prompt and bot response` |
+| `//!` | **Critical Hazards & Invariants** | 🔴 Red | Warns of breaking changes, database risks, or third-party quirks. | `//! Note: File must be uploaded with contentType, else WhatsApp rejects application/octet-stream` |
+| `//&` | **Domain Boundaries** | 🟣 Purple | Visual separators for sub-modules, modules, or major routing groups. | `//& Customer Escalation & Ticket SLAs 🎫` |
+| `//*` | **Business Rule Constraints** | 🟢 Green | Specific business rules, legal compliance, or time-window limitations. | `//* Not sending followup messages outside 9 AM to 9 PM contact local time` |
+| `/** ... */` | **JSDoc Rationale** | White | Multi-line documentation on engineering decisions and interface contracts. | Explain why PNG is used over SVG in email, or why custom Crockford alphabet was chosen |
+
+### C. Guard Clauses & Early Returns (Kill the Arrow Anti-Pattern)
+Never nest code 4 levels deep in `if/else` ladders. Validate pre-conditions early and return immediately. Keep the "happy path" flat against the left margin:
+
+```typescript
+// ✅ Clean, flat guard clauses
+export async function processPayment(req: Request, res: Response) {
+    if (!req.currentOrganizationUser) {
+        return sendError(res, 'Unauthorized', 401);
+    }
+    if (!req.body.items?.length) {
+        return sendError(res, 'No items provided', 400);
+    }
+    const isAvailable = await checkStock(req.body.items);
+    if (!isAvailable) {
+        return sendError(res, 'Inventory out of stock', 409);
+    }
+
+    // Happy path is flat and easily readable:
+    const receipt = await orderOrchestrator.checkout(req.body);
+    return sendResponse(res, receipt, 'Payment processed', 201);
+}
+```
+
+### D. Single Level of Abstraction Principle (SLAP)
+High-level orchestrators should read like a table of contents, delegating low-level operations (raw SQL strings, S3 uploads, multi-part email construction) to dedicated helper functions.
+
+### E. The 65-Line Controller Rule & Zero Zombie Code
+- **65-Line Limit**: HTTP controllers must only parse, validate, call an orchestrator, and return an envelope. Exceeding 65 lines indicates business logic leakage.
+- **Zero Zombie Code**: Never commit commented-out code blocks (`// const oldQuery = ...`). Trust Git history.
+
+### F. Boolean Naming Conventions
+Always use active predicate prefixes: `isValid`, `hasPermission`, `canRetry`, `shouldEscalate`, `isGuest`. Never use bare nouns (`valid`, `permission`).
 
 ---
 
@@ -986,6 +1028,10 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Do** use `satisfies Prisma.Select` and `Prisma.GetPayload` to extract database DTOs with zero `as any`.
 - **Do** return `Result<T, DomainError>` for predictable business failures instead of throwing exceptions.
 - **Do** use `assertNever(x)` in `default:` branches of switch statements for exhaustive compile-time verification.
+- **Do** explain *why* in comments, never *what* (no obvious restatements of code).
+- **Do** use guard clauses with early returns to keep the happy path completely flat against the left margin.
+- **Do** keep HTTP controllers under 65 lines of code, delegating domain logic to orchestrators.
+- **Do** prefix boolean variables with active predicates (`isValid`, `hasPermission`, `canRetry`).
 
 ### ❌ DON'Ts:
 - **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
@@ -994,6 +1040,10 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Never** retry without an Idempotency-Key on non-idempotent mutations.
 - **Never** retry without jitter or beyond the 10% retry budget.
 - **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
+- **Never** write redundant comments that state the obvious (`// get user by id: await getUserById()`).
+- **Never** nest logic 3+ levels deep inside `if/else` ladders (arrow code anti-pattern).
+- **Never** commit commented-out zombie code (`// const oldLogic = ...`). Rely on Git history.
+- **Never** allow controllers to grow beyond 65 lines of code.
 - **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
 - **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
 - **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.

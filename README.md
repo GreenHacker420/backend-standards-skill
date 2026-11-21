@@ -85,6 +85,8 @@ This repository codifies the architectural discipline to eliminate these problem
 13. **Make Illegal States Unrepresentable**: Model domain lifecycle phases as state-discriminated unions so impossible combinations cannot compile.
 14. **The Result Pattern**: Return `{ ok: true, data } | { ok: false, error }` for domain errors instead of throwing unchecked exceptions.
 15. **Type-Safe Prisma Projections (Zero `as any`)**: Enforce exact SQL projection contracts with `satisfies Prisma.Select` and `Prisma.GetPayload`.
+16. **Semantic Commenting Taxonomy (`Better Comments` Style)**: Color-coded visual tags (`//?` Rationale, `//!` Invariants/Hazards, `//*` Business Rules, `//&` Boundaries). Comments explain *why*, never *what*.
+17. **Guard Clauses & Flat Code Hierarchy**: Kill the arrow anti-pattern with early return guard clauses. Enforce the 65-line controller rule and zero commented-out zombie code.
 
 ---
 
@@ -94,6 +96,7 @@ This repository codifies the architectural discipline to eliminate these problem
 .
 ├── SKILL.md                       # Master single-file skill for AI Agents (Antigravity / Claude Code / Cursor)
 ├── examples/                      # Compilable, production-ready TypeScript reference implementations
+│   ├── clean-code/                # Guard clauses, semantic comments, SLAP narrative
 │   ├── controllers/               # 1-action controller templates with Zod DTOs
 │   ├── modular/                   # Modular Vertical Slice architecture example (orders module)
 │   ├── orchestrators/             # Domain orchestrators decoupled from HTTP transport
@@ -110,7 +113,8 @@ This repository codifies the architectural discipline to eliminate these problem
 │   ├── 06-tail-sampling-and-advanced-tracing.md
 │   ├── 07-failure-recovery-retry-budgets-dlq.md
 │   ├── 08-parse-dont-validate-and-domain-types.md
-│   └── 09-result-pattern-and-prisma-types.md
+│   ├── 09-result-pattern-and-prisma-types.md
+│   └── 10-commenting-clean-code-and-readability.md
 └── package.json
 ```
 
