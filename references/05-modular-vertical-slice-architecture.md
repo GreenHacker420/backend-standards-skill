@@ -1,7 +1,7 @@
 # Modular & Vertical Slice Architecture
 
 ## Core Philosophy
-In traditional Layered Architecture, code is organized horizontally (`controllers/`, `services/`, `models/`, `routes/`). As an application grows beyond 20+ endpoints, this creates high cognitive friction: touching a single feature requires jumping between 4-5 distant directories, and dead code becomes nearly impossible to track.
+In traditional Layered Architecture, code is organized horizontally (`controllers/`, `services/`, `models/`, `routes/`). As an application grows across multiple distinct domain contexts, horizontal organization creates high cognitive friction: touching a single feature requires jumping between 4-5 distant directories, and dead code becomes nearly impossible to track.
 
 **Modular (Vertical Slice) Architecture** groups code around **Business Capabilities and Bounded Contexts**. Each domain module encapsulates its own routes, single-action controllers, validation schemas, business orchestrators, and direct data projections.
 
@@ -11,8 +11,8 @@ In traditional Layered Architecture, code is organized horizontally (`controller
 
 | Architecture Style | Ideal Use Case | Pros | Trade-offs |
 | :--- | :--- | :--- | :--- |
-| **Layered / Domain-Grouped** (`src/controllers/<domain>/`, `src/lib/<domain>/`) | Focused microservices, single bounded context, < 20 endpoints | Extremely straightforward; rapid initial setup; simple mental model for small services. | Higher file scattering as codebase grows; requires discipline to avoid leaky cross-layer calls. |
-| **Modular Vertical Slices** (`src/modules/<feature>/`) | Medium-to-large modular monoliths, multi-domain SaaS, > 20 endpoints | Maximum feature cohesion; trivial to isolate dead features; clean bounded public contracts (`index.ts`). | Requires upfront architectural boundary definition; slight boilerplate duplication for independent schemas. |
+| **Layered / Domain-Grouped** (`src/controllers/<domain>/`, `src/lib/<domain>/`) | Focused microservices, single domain bounded context | Extremely straightforward; rapid initial setup; simple mental model for small services. | Higher file scattering as codebase grows; requires discipline to avoid leaky cross-layer calls. |
+| **Modular Vertical Slices** (`src/modules/<feature>/`) | Multi-domain monoliths, complex bounded contexts, autonomous team domains | Maximum feature cohesion; trivial to isolate dead features; clean bounded public contracts (`index.ts`). | Requires upfront architectural boundary definition; slight boilerplate duplication for independent schemas. |
 
 ---
 

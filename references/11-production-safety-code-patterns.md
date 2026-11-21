@@ -142,8 +142,8 @@ export async function withPostgresAdvisoryLock<T>(
 ### The Vulnerability: Equal-Cost Rate Limiting
 A naive rate limiter gives every request the same weight (e.g. 100 requests per minute). An attacker can submit 95 heavy requests (e.g. generating a 500-page PDF export or computing dense vector embeddings), completely saturating server CPU while remaining under the rate limit.
 
-### The Production Standard: Cost-Weighted Token Bucket
-Assign a dynamic computational "cost" (points) to each route. Cheap queries cost 1 token; expensive operations cost 10-25 tokens.
+### The Production Standard: Cost-Weighted Rate Limiting (Atomic Fixed-Window Counter)
+Assign a dynamic computational "cost" (points) to each route. Cheap queries cost 1 token; expensive operations cost 10-25 tokens. Uses an atomic Redis script to increment points and bind TTL in a single operation, with fail-closed validation of calculated cost.
 
 ```typescript
 import { Request, Response, NextFunction } from 'express';
@@ -170,29 +170,47 @@ export class CostWeightedRateLimiter {
     const { windowSeconds, maxPoints, costCalculator = () => 1 } = options;
 
     return async (req: Request, res: Response, next: NextFunction) => {
-      const rawCost = costCalculator(req);
-      const cost = Number.isInteger(rawCost) && rawCost > 0 ? rawCost : 1;
-      const orgId = req.currentOrganizationUser?.organizationId;
-      const key = orgId
-        ? `ratelimit:org:${orgId}`
-        : `ratelimit:ip:${req.ip || 'unknown'}`;
+      try {
+        const rawCost = costCalculator(req);
+        if (!Number.isInteger(rawCost) || rawCost <= 0) {
+          throw new TypeError(`[CostRateLimiter] Invalid cost calculated: ${rawCost}. Cost must be a positive integer.`);
+        }
+        const cost = rawCost;
+        const orgId = req.currentOrganizationUser?.organizationId;
+        const key = orgId
+          ? `ratelimit:org:${orgId}`
+          : `ratelimit:ip:${req.ip || 'unknown'}`;
 
-      // Atomic execution: increments counter and binds TTL in a single Redis transaction
-      const current = (await this.redis.eval(
-        ATOMIC_COST_LIMITER_LUA,
-        1,
-        key,
-        cost,
-        windowSeconds
-      )) as number;
+        // Atomic execution: increments counter and binds TTL in a single Redis transaction
+        const current = (await this.redis.eval(
+          ATOMIC_COST_LIMITER_LUA,
+          1,
+          key,
+          cost,
+          windowSeconds
+        )) as number;
 
-      res.setHeader('X-RateLimit-Limit', maxPoints);
-      res.setHeader('X-RateLimit-Remaining', Math.max(0, maxPoints - current));
+        res.setHeader('X-RateLimit-Limit', maxPoints);
+        res.setHeader('X-RateLimit-Remaining', Math.max(0, maxPoints - current));
 
-      if (current > maxPoints) {
-        res.setHeader('Retry-After', windowSeconds);
-        res.status(429).json({
-          success: false,
+        if (current > maxPoints) {
+          res.setHeader('Retry-After', windowSeconds);
+          res.status(429).json({
+            success: false,
+            message: 'Rate limit exceeded. Please slow down your requests.',
+            details: { costIncurred: cost, retryAfter: windowSeconds },
+          });
+          return;
+        }
+
+        next();
+      } catch (err) {
+        next(err);
+      }
+    };
+  }
+}
+```
           message: 'Rate limit quota exceeded. Please reduce request frequency.',
           details: { costIncurred: cost, retryAfterSeconds: windowSeconds }
         });

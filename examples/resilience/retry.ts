@@ -63,8 +63,10 @@ export function extractRetryAfterMs(error: unknown): number | null {
  *    if the operation is marked `isIdempotent: true` OR `isDatabaseOnlyTransaction: true`.
  *    If an operation performs external side-effects (e.g. notifications, payment calls) before/around
  *    the database transaction, retrying upon DB deadlock repeats those external effects!
- * 2. Pre-query connection failures (P1001, P2024, ECONNREFUSED, ENOTFOUND) are safe because
- *    the engine never received or began executing the operation.
+ * 2. Pre-query connection failures (P1001, P2024, ECONNREFUSED, ENOTFOUND) are safe
+ *    ONLY if the operation is marked `isIdempotent: true` OR `isDatabaseOnlyTransaction: true`.
+ *    If an operation performs external side-effects prior to the failed database connection,
+ *    retrying the outer operation without idempotency repeats those external side-effects!
  * 3. Uncertain mid-query database drops (P1002, P1017), HTTP 429 (RFC 6585 permits upstream work prior to 429),
  *    and network drops (ECONNRESET, ETIMEDOUT, 502, 503, 504) are ONLY retried if `isIdempotent === true`.
  * 4. 4xx Client Errors (400, 401, 403, 404, 422) must NEVER be retried.
@@ -90,7 +92,7 @@ export function isTransientError(
             return isIdempotent || isDatabaseOnlyTransaction;
         }
 
-        // Pre-query failures (query never reached or began execution on the database engine)
+        // Pre-query failures: safe ONLY if idempotent OR guaranteed DB-only transaction
         const preQueryCodes = new Set([
             'P1001', // Cannot reach database server
             'P2024', // Timed out fetching a connection from the pool
@@ -98,7 +100,7 @@ export function isTransientError(
             'ENOTFOUND',
         ]);
         if (preQueryCodes.has(err.code)) {
-            return true;
+            return isIdempotent || isDatabaseOnlyTransaction;
         }
 
         // Mid-flight drops & timeouts (Execution outcome uncertain; server may have committed!)
@@ -157,6 +159,21 @@ export function isTransientError(
 }
 
 /**
+ * Computes backoff delay with AWS Full Jitter.
+ * Formula: delay = random(0, min(maxDelayMs, minDelayMs * factor^(attempt - 1)))
+ */
+export function calculateDelay(
+    attempt: number,
+    minDelayMs: number,
+    maxDelayMs: number,
+    factor: number,
+    jitter: boolean
+): number {
+    const ceiling = Math.min(maxDelayMs, minDelayMs * Math.pow(factor, attempt - 1));
+    return jitter ? Math.random() * ceiling : ceiling;
+}
+
+/**
  * Retries an asynchronous operation with AWS Full Jitter and strict idempotency enforcement.
  */
 export async function withRetry<T>(
@@ -205,11 +222,8 @@ export async function withRetry<T>(
                 });
             }
 
-            // 3. Compute exponential ceiling
-            const ceiling = Math.min(maxDelayMs, minDelayMs * Math.pow(factor, attempt - 1));
-
-            // 4. Apply AWS Full Jitter: Uniform random distribution between 0 and ceiling
-            let delay = jitter ? Math.random() * ceiling : ceiling;
+            // 3. Compute backoff delay (Full Jitter or deterministic ceiling)
+            let delay = calculateDelay(attempt, minDelayMs, maxDelayMs, factor, jitter);
 
             // 5. Honor remote Retry-After header with optional jitter smoothing
             const retryAfterMs = extractRetryAfterMs(error);

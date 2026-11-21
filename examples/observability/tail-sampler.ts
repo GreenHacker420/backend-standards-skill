@@ -54,6 +54,22 @@ export class TailSampler {
       traceTtlMs: 30_000,
       ...policy,
     };
+
+    //? Validate rates and thresholds
+    const rates = [
+      this.policy.errorSamplingRate,
+      this.policy.slowSamplingRate,
+      this.policy.tier0SamplingRate,
+      this.policy.baselineSamplingRate,
+    ];
+    for (const r of rates) {
+      if (typeof r !== 'number' || Number.isNaN(r) || r < 0 || r > 1) {
+        throw new RangeError('[TailSampler] Sampling rates must be numbers between 0.0 and 1.0.');
+      }
+    }
+    if (this.policy.slowThresholdMs <= 0 || this.policy.maxActiveTraces <= 0 || this.policy.maxSpansPerTrace <= 0) {
+      throw new RangeError('[TailSampler] Thresholds and capacities must be positive integers.');
+    }
   }
 
   //? Evicts abandoned traces to guarantee zero unbounded memory growth
@@ -67,25 +83,28 @@ export class TailSampler {
   }
 
   public recordSpan(span: Span): void {
-    // Periodic bounded eviction
-    if (this.inFlightTraces.size >= this.policy.maxActiveTraces) {
-      this.pruneExpiredTraces();
-      // If still saturated, drop span to prevent heap exhaustion
-      if (this.inFlightTraces.size >= this.policy.maxActiveTraces) {
-        return;
-      }
-    }
+    let entry = this.inFlightTraces.get(span.traceId);
 
-    const entry = this.inFlightTraces.get(span.traceId) ?? {
-      createdAt: Date.now(),
-      spans: [],
-    };
+    // Only apply trace capacity bounds when creating a brand NEW trace entry
+    if (!entry) {
+      if (this.inFlightTraces.size >= this.policy.maxActiveTraces) {
+        this.pruneExpiredTraces();
+        // If still saturated after pruning, drop the new trace to protect heap
+        if (this.inFlightTraces.size >= this.policy.maxActiveTraces) {
+          return;
+        }
+      }
+
+      entry = {
+        createdAt: Date.now(),
+        spans: [],
+      };
+      this.inFlightTraces.set(span.traceId, entry);
+    }
 
     if (entry.spans.length < this.policy.maxSpansPerTrace) {
       entry.spans.push(span);
     }
-
-    this.inFlightTraces.set(span.traceId, entry);
   }
 
   /**
@@ -98,34 +117,41 @@ export class TailSampler {
     const entry = this.inFlightTraces.get(traceId);
     this.inFlightTraces.delete(traceId);
 
-    const spans = entry?.spans ?? [];
+    if (!entry) {
+      return { sampled: false, reason: 'trace_not_found_or_evicted', spans: [] };
+    }
 
-    // Rule 1: Errors (5xx or explicit error)
-    if (metadata.statusCode >= 500 || spans.some((s) => s.error)) {
+    // 1. Errors: 100% sample rate (HTTP 5xx or explicitly flagged error spans)
+    const hasError = metadata.statusCode >= 500 || entry.spans.some((s) => s.error);
+    if (hasError) {
       if (Math.random() < this.policy.errorSamplingRate) {
-        return { sampled: true, reason: 'error_occurred', spans };
+        return { sampled: true, reason: 'error_retention', spans: entry.spans };
       }
     }
 
-    // Rule 2: Latency Outliers (slow-request threshold)
+    // 2. Slow Requests: 100% sample rate for latency outliers exceeding threshold
     if (metadata.durationMs >= this.policy.slowThresholdMs) {
       if (Math.random() < this.policy.slowSamplingRate) {
-        return { sampled: true, reason: 'latency_threshold_exceeded', spans };
+        return { sampled: true, reason: 'slow_outlier_retention', spans: entry.spans };
       }
     }
 
-    // Rule 3: Critical Tier 0 paths (Checkout / Auth)
+    // 3. Tier 0 Critical Workloads: 100% sample rate
     if (metadata.tier === 0) {
       if (Math.random() < this.policy.tier0SamplingRate) {
-        return { sampled: true, reason: 'tier_0_critical', spans };
+        return { sampled: true, reason: 'tier0_revenue_retention', spans: entry.spans };
       }
     }
 
-    // Rule 4: Normal Fast Baseline (e.g. 1%)
+    // 4. Baseline Downsampling: Keep small deterministic sample of healthy fast traces
     if (Math.random() < this.policy.baselineSamplingRate) {
-      return { sampled: true, reason: 'probabilistic_baseline', spans };
+      return { sampled: true, reason: 'baseline_sample', spans: entry.spans };
     }
 
-    return { sampled: false, reason: 'dropped_healthy', spans: [] };
+    return { sampled: false, reason: 'dropped_healthy_fast_trace', spans: [] };
+  }
+
+  public getActiveTraceCount(): number {
+    return this.inFlightTraces.size;
   }
 }

@@ -13,13 +13,41 @@ export type OrderId = Brand<number, 'OrderId'>;
 export type OrganizationId = Brand<number, 'OrganizationId'>;
 export type Email = Brand<string, 'Email'>;
 
-// Safe parser factories
-export const asUserId = (id: number): UserId => id as UserId;
-export const asOrderId = (id: number): OrderId => id as OrderId;
-export const asOrgId = (id: number): OrganizationId => id as OrganizationId;
+//? Zod v4 schemas for boundary validation
+const PositiveSafeIntegerSchema = z.int().positive().refine(
+  (val) => Number.isSafeInteger(val),
+  { message: 'Value exceeds safe integer bounds' }
+);
 
-//? Robust RFC-compliant email parsing via Zod
-const EmailSchema = z.string().trim().email();
+const EmailSchema = z.email();
+
+/**
+ * Safe Smart Constructors:
+ * Validates runtime values against invariants before asserting nominal brand.
+ */
+export function parseUserId(raw: unknown): Result<UserId, 'INVALID_USER_ID'> {
+  const parseResult = PositiveSafeIntegerSchema.safeParse(raw);
+  if (!parseResult.success) {
+    return fail('INVALID_USER_ID');
+  }
+  return ok(parseResult.data as UserId);
+}
+
+export function parseOrderId(raw: unknown): Result<OrderId, 'INVALID_ORDER_ID'> {
+  const parseResult = PositiveSafeIntegerSchema.safeParse(raw);
+  if (!parseResult.success) {
+    return fail('INVALID_ORDER_ID');
+  }
+  return ok(parseResult.data as OrderId);
+}
+
+export function parseOrgId(raw: unknown): Result<OrganizationId, 'INVALID_ORGANIZATION_ID'> {
+  const parseResult = PositiveSafeIntegerSchema.safeParse(raw);
+  if (!parseResult.success) {
+    return fail('INVALID_ORGANIZATION_ID');
+  }
+  return ok(parseResult.data as OrganizationId);
+}
 
 export function parseEmail(raw: unknown): Result<Email, 'INVALID_EMAIL_FORMAT'> {
   const parseResult = EmailSchema.safeParse(raw);

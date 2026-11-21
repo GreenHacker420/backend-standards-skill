@@ -29,9 +29,10 @@ When an upstream dependency slows down, this surge of retries pushes it into a h
 
 | Error Category | Status / Error Codes | Action | Strategy |
 | :--- | :--- | :---: | :--- |
-| **Transient** | `503 Service Unavailable`<br>`429 Too Many Requests`<br>`ECONNRESET`, `ETIMEDOUT` | ✅ Retry | Retry with Full Jitter, deduct from Retry Budget, honor `Retry-After` header. |
+| **Transient Network / HTTP (Idempotent)** | `503 Service Unavailable`<br>`429 Too Many Requests`<br>`502 / 504 Gateway Errors`<br>`ECONNRESET`, `ETIMEDOUT` | ✅ Retry | Requires `isIdempotent: true`! Retry with Full Jitter, deduct from Retry Budget, honor `Retry-After`. |
+| **Database Deadlock / Pre-Query** | `40P01 Deadlock`<br>`40001 Serialization`<br>`P2034 Write Conflict`<br>`P1001 / P2024 Pool Timeout` | ✅ Retry | Safe if `isIdempotent: true` OR `isDatabaseOnlyTransaction: true`. |
 | **Terminal / Client** | `400 Bad Request`<br>`401 Unauthorized`<br>`403 Forbidden`<br>`404 Not Found`<br>`422 Unprocessable` | ❌ Do NOT Retry | Fail fast immediately. Retrying bad input wastes CPU and bandwidth. |
-| **Non-Idempotent** | Unkeyed `POST`<br>Payment authorizations | ❌ Do NOT Retry | **Never retry without an `Idempotency-Key`**. |
+| **Non-Idempotent** | Unkeyed `POST`<br>Payment authorizations | ❌ Do NOT Retry | **Never retry without a verified `Idempotency-Key`**. |
 | **Internal Server Error** | `500 Internal Server Error` | ⚠️ Max 1 | Often indicative of application bugs. Retry at most once if idempotent. |
 
 ---

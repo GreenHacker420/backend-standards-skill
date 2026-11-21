@@ -19,9 +19,9 @@ This skill prescribes the exact architectural conventions, coding patterns, comm
 When authoring backend code, adhere strictly to these core principles:
 
 1. **Simplicity Over Abstraction**: Avoid heavy enterprise patterns, complex inheritance hierarchies, or opaque dependency injection containers. Rely on explicit, readable functional composition and direct Prisma queries.
-2. **Database as Single Source of Truth (Zero Hardcoding)**:
-   - Business rules, feature flags, tenant quotas, role permissions, notification copy, and integration credentials must **never** be hardcoded in TypeScript.
-   - Code defines structures, types, and execution engines; the Database stores the configuration, limits, and state.
+2. **Database as Single Source of Truth (Zero Hardcoded Business Rules)**:
+   - Operational business configurations, tenant quotas, pricing tiers, role permissions, feature flags, and customer-facing copy must **never** be hardcoded in TypeScript.
+   - Code defines types, mathematical invariants, security boundaries, and execution engines; the Database stores dynamic tenant configuration, limits, pricing, and state. (Technical protocol constants like RFC specs, HTTP status codes, and crypto algorithms remain code invariants).
 3. **Service Criticality Tiering & Graceful Degradation**:
    - Classify every endpoint and service into explicit priority tiers: **Tier 0** (Checkout, Auth, Payments — *never shed*), **Tier 1** (Catalog, Cart read — *cache fallback*), **Tier 2** (Recommendations, Personalization, AI — *shed first under load*), and **Tier 3** (Reports, Batch jobs — *hard shed*).
    - Under database or CPU overload, automatically shed or degrade Tier-2/3 operations to preserve capacity for Tier-0.
@@ -737,9 +737,10 @@ To prevent cascading retry storms where layered services multiply retries ($3 \t
 
 | Category | HTTP / System Codes | Retry Action | Strategy |
 | :--- | :--- | :---: | :--- |
-| **Transient** | `503`, `429`, `ECONNRESET`, `ETIMEDOUT` | ✅ Retry | Retry with Full Jitter, deduct from Retry Budget, honor `Retry-After`. |
+| **Transient (Idempotent)** | `503`, `429`, `502`, `504`, `ECONNRESET`, `ETIMEDOUT` | ✅ Retry | Retry with Full Jitter, deduct from Retry Budget, honor `Retry-After`. Requires `isIdempotent: true`! |
+| **Database Deadlock / Pre-Query** | `40P01`, `40001`, `P2034`, `P1001`, `P2024`, `ECONNREFUSED` | ✅ Retry | Safe to retry if `isIdempotent: true` OR `isDatabaseOnlyTransaction: true`. |
 | **Terminal / Client** | `400`, `401`, `403`, `404`, `422` | ❌ Do NOT Retry | Fail fast immediately. Retrying bad input wastes CPU and bandwidth. |
-| **Non-Idempotent** | Unkeyed `POST`, payment charges | ❌ Do NOT Retry | **Never retry without an `Idempotency-Key`**. |
+| **Non-Idempotent** | Unkeyed `POST`, payment mutations | ❌ Do NOT Retry | **Never retry without a verified `Idempotency-Key`**. |
 | **Internal Server Error** | `500 Internal Server Error` | ⚠️ Max 1 | Often indicative of application bugs. Retry at most once if idempotent. |
 
 ### Dead Letter Queue (DLQ) & Poison Pill Quarantine
@@ -1376,45 +1377,6 @@ if (updated.count === 0) {
 - **Never** omit `organizationId` from Optimistic Concurrency Control (`version`) updates.
 - **Never** rely on restrictive-only RLS policies without a permissive base policy (blocks all tenant rows).
 - **Never** terminate graceful shutdown with raw `process.exit(0)` before flushing logger transports.
-- **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
-- **Never** compare cryptographic signatures or tokens using standard `===` (vulnerable to timing attacks).
-- **Never** read entire large files into memory with `fs.readFileSync` or accumulate unbounded arrays.
-- **Never** rely on Redis distributed locks for operations that require ACID rollback guarantees.
-- **Never** write redundant comments that state the obvious (`// get user by id: await getUserById()`).
-- **Never** nest logic 3+ levels deep inside `if/else` ladders (arrow code anti-pattern).
-- **Never** commit commented-out zombie code (`// const oldLogic = ...`). Rely on Git history.
-- **Don't** let business workflows or persistence logic accumulate in controllers; review unusually long handlers and refactor when it improves clarity.
-- **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
-- **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
-- **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.
-- **Never** create "kitchen-sink" interfaces with dozens of optional fields (`paidAt?`, `refundedAt?`) when state is mutually exclusive.
-- **Never** leave floating promises un-awaited or without a `.catch()` handler.
-- **Never** swallow errors silently (`catch (e) {}`) without logging or proper handling.
-- **Never** retry permanent client errors (HTTP 400, 401, 403, 404, 422).
-- **Never** hardcode tenant quotas, feature flags, or permission rules in code. Query the DB.
-- **Never** use `(req as any)` to access user or session data. Update `src/typings/index.d.ts` instead.
-- **Never** return raw objects like `res.json({ foo: 'bar' })` or ad-hoc error formats.
-- **Never** perform business logic directly inside Express route files (`.routes.ts`).
-- **Never** read `process.env.*` directly throughout the codebase. Import from `@/env`.
-- **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
-- **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
-- **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.
-- **Never** create "kitchen-sink" interfaces with dozens of optional fields (`paidAt?`, `refundedAt?`) when state is mutually exclusive.
-- **Never** leave floating promises un-awaited or without a `.catch()` handler.
-- **Never** swallow errors silently (`catch (e) {}`) without logging or proper handling.
-- **Never** retry permanent client errors (HTTP 400, 401, 403, 404, 422).
-- **Never** hardcode tenant quotas, feature flags, or permission rules in code. Query the DB.
-- **Never** use `(req as any)` to access user or session data. Update `src/typings/index.d.ts` instead.
-- **Never** return raw objects like `res.json({ foo: 'bar' })` or ad-hoc error formats.
-- **Never** perform business logic directly inside Express route files (`.routes.ts`).
-- **Never** read `process.env.*` directly throughout the codebase. Import from `@/env`.
-
-### ❌ DON'Ts:
-- **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
-- **Never** query another module's database tables directly in a modular architecture (use public module interfaces).
-- **Never** perform dual writes (e.g. updating Postgres then publishing directly to Kafka/Rabbit/BullMQ without an outbox).
-- **Never** retry without an Idempotency-Key on non-idempotent mutations.
-- **Never** retry without jitter or beyond the 10% retry budget.
 - **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
 - **Never** compare cryptographic signatures or tokens using standard `===` (vulnerable to timing attacks).
 - **Never** read entire large files into memory with `fs.readFileSync` or accumulate unbounded arrays.

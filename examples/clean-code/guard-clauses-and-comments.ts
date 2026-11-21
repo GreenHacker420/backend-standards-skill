@@ -1,4 +1,4 @@
-import { Request, Response } from 'express';
+import { Request, Response, NextFunction } from 'express';
 
 //& Domain Boundary: Order Processing Action 🛒
 
@@ -7,9 +7,14 @@ import { Request, Response } from 'express';
  * 1. Semantic Commenting Grammar (//?, //!, //*)
  * 2. Guard Clauses & Early Returns (Zero deep nesting)
  * 3. Single Level of Abstraction Principle (SLAP)
- * 4. Strict Under-65-Line Controller Rule
+ * 4. Advisory ~65-Line Controller Guideline (Transport only)
+ * 5. Robust centralized error delegation via next(error)
  */
-export async function createOrderAction(req: Request, res: Response): Promise<void> {
+export async function createOrderAction(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   // 1. Guard Clause: Authentication pre-condition
   if (!req.currentOrganizationUser) {
     res.status(401).json({ success: false, message: 'Unauthorized' });
@@ -24,7 +29,7 @@ export async function createOrderAction(req: Request, res: Response): Promise<vo
   }
 
   //? L1 in-memory check avoids a database roundtrip for active fraud-flagged accounts
-  const isSuspended = req.currentOrganizationUser.organization.customerType === 'SUSPENDED';
+  const isSuspended = req.currentOrganizationUser.organization?.customerType === 'SUSPENDED';
   if (isSuspended) {
     res.status(403).json({ success: false, message: 'Account is temporarily suspended' });
     return;
@@ -48,8 +53,7 @@ export async function createOrderAction(req: Request, res: Response): Promise<vo
       meta: { traceId: req.traceId ?? 'unknown' }
     });
   } catch (error) {
-    req.logger?.error('Order placement failed', { error });
-    res.status(500).json({ success: false, message: 'Internal Server Error' });
+    next(error);
   }
 }
 

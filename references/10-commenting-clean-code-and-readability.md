@@ -107,8 +107,8 @@ export async function completeCheckout(input: CheckoutInput): Promise<Order> {
 }
 ```
 
-### C. The 65-Line Controller Rule
-HTTP controllers must only parse, validate, call an orchestrator, and return an envelope. A controller exceeding 65 lines is an anti-pattern indicating that business logic or database queries have leaked into the transport layer.
+### C. The ~65-Line Controller Guideline (Advisory Review Threshold)
+HTTP controllers must focus strictly on transport concerns: parse and validate the request, check session pre-conditions, delegate to a domain orchestrator, and return a standardized envelope. Use roughly 65 lines as an advisory review threshold—an unusually long controller is a signal that domain orchestration or database queries may have leaked into the transport layer and should be refactored when it improves clarity.
 
 ### D. Boolean Naming Conventions
 Booleans must always use active predicate prefixes:

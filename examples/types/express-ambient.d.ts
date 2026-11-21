@@ -7,6 +7,13 @@ export interface AuthenticatedUser {
     organizationId: number;
     email: string;
     role: 'ADMIN' | 'MEMBER' | 'OWNER';
+    timezone?: string;
+    organization?: {
+        id?: number;
+        name?: string;
+        codeName?: string;
+        customerType?: 'REGULAR' | 'PREMIUM' | 'SUSPENDED';
+    };
 }
 
 declare global {

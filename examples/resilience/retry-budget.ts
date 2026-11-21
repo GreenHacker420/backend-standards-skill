@@ -19,6 +19,7 @@ export interface RetryBudgetOptions {
   retryRatio?: number;      // Fraction of regular requests that may be retried (default: 0.10 = 10%)
   maxTokens?: number;       // Upper bound on token capacity (default: 100)
   minRetriesPerSec?: number;// Small baseline drip to allow retries during very low traffic (default: 1)
+  initialTokens?: number;   // Initial bootstrap tokens (default: 10)
 }
 
 export class TokenBucketRetryBudget {
@@ -32,7 +33,7 @@ export class TokenBucketRetryBudget {
     this.retryRatio = options.retryRatio ?? 0.10;
     this.maxTokens = options.maxTokens ?? 100;
     this.minRetriesPerSec = options.minRetriesPerSec ?? 1;
-    this.tokens = 10; // Initial bootstrap burst
+    this.tokens = options.initialTokens ?? 10;
     this.lastDripTime = Date.now();
   }
 
@@ -64,8 +65,9 @@ export class TokenBucketRetryBudget {
    */
   public canRetry(): boolean {
     this.replenish();
-    if (this.tokens >= 1.0) {
-      this.tokens -= 1.0;
+    // Use epsilon (1e-9) to prevent floating-point precision drift (e.g. 10 * 0.1 = 0.9999999999999999)
+    if (this.tokens >= 1.0 - 1e-9) {
+      this.tokens = Math.max(0, this.tokens - 1.0);
       return true;
     }
     return false;

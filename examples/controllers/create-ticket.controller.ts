@@ -7,7 +7,7 @@ export const CreateTicketSchema = z.object({
     subject: z.string().min(3).max(255),
     description: z.string().optional().default(''),
     priority: z.enum(['low', 'medium', 'high']).default('low'),
-    contactId: z.number().int().positive().optional(),
+    contactId: z.int().positive().optional(),
 });
 export type CreateTicketDTO = z.infer<typeof CreateTicketSchema>;
 
@@ -18,7 +18,7 @@ export default async function createTicketController(req: Request, res: Response
         if (!parseResult.success) {
             return res.status(400).json({
                 error: true,
-                message: parseResult.error.errors[0].message,
+                message: parseResult.error.issues[0]?.message ?? 'Invalid request body',
                 invalidFormat: parseResult.error.format(),
             });
         }
