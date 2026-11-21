@@ -52,7 +52,7 @@ When authoring backend code, adhere strictly to these core principles:
     - Register shutdown coordinators handling `SIGTERM` / `SIGINT` to drain in-flight requests, pause queue consumers, finish active jobs, and disconnect pools cleanly before exiting.
 12. **Class-Based Subsystems for Stateful Infrastructure**: Use classes **only** for stateful components that maintain connections, lifecycles, connection pooling, or event listeners (e.g., `CacheManager`, `PubSubManager`, `MailClient`, `S3Client`, `Database`).
 13. **Action-Based Controller Decomposition (1 Action = 1 File)**: Never create a monolithic 1,000-line controller class. Split each API action into its own file (`create.ts`, `update.ts`, `archive.ts`, `get-pool.ts`).
-14. **Domain Orchestrator Pattern**: Complex workflows that touch multiple subsystems (DB + S3 + Cache + BullMQ + PubSub) belong in `src/lib/<domain>/`, keeping HTTP controllers slim (under 50 lines).
+14. **Domain Orchestrator Pattern**: Complex workflows that touch multiple subsystems (DB + S3 + Cache + BullMQ + PubSub) belong in `src/lib/<domain>/`, keeping HTTP controllers focused; roughly 65 lines is an advisory review threshold, not a hard cap.
 15. **Inline Schema Validation with Type Inference**: Define request validation schemas (using Zod or Joi) directly at the top of each controller file. Infer and export the request DTO type.
 16. **Ambient Typing & Namespace Augmentation**: Extend Express's `Request` and Prisma's JSON types ambiently in `src/typings/index.d.ts` so all handlers receive typed access to auth sessions, correlation IDs, and loggers without type assertions (`as any`).
 17. **Semantic Commenting Taxonomy**: Use visual semantic tags (`//?`, `//!`, `//&`, `//*`) to clearly convey rationale, critical hazards, domain boundaries, and business constraints.
@@ -70,7 +70,7 @@ When authoring backend code, adhere strictly to these core principles:
 29. **The Single Options Object Pattern**: Wrap function arguments in a single `readonly options: { ... }` object to prevent accidental parameter swapping bugs.
 30. **Semantic Commenting Taxonomy (`Better Comments` Style)**: Comments must document *why*, never *what*. Use semantic tags (`//?` Rationale, `//!` Hazards/Invariants, `//*` Business Rules, `//&` Boundaries). Never state the obvious.
 31. **Guard Clauses & Flat Code Hierarchy**: Eliminate deep nesting (arrow code) by validating pre-conditions early and returning immediately. Keep the happy path flat against the left margin.
-32. **The 65-Line Controller Rule & Zero Dead Code**: Controllers must remain under 65 lines of code, delegating workflows to orchestrators. Never commit commented-out zombie code; rely on Git history.
+32. **Controller Size Heuristic & Zero Dead Code**: Keep controllers focused on transport concerns and delegate domain workflows to orchestrators. Roughly 65 lines is an advisory review threshold, not a hard cap; longer handlers should be reviewed for misplaced responsibilities and simplified when appropriate. Never commit commented-out zombie code; rely on Git history.
 
 ---
 
@@ -446,8 +446,8 @@ export async function processPayment(req: Request, res: Response) {
 ### D. Single Level of Abstraction Principle (SLAP)
 High-level orchestrators should read like a table of contents, delegating low-level operations (raw SQL strings, S3 uploads, multi-part email construction) to dedicated helper functions.
 
-### E. The 65-Line Controller Rule & Zero Zombie Code
-- **65-Line Limit**: HTTP controllers must only parse, validate, call an orchestrator, and return an envelope. Exceeding 65 lines indicates business logic leakage.
+### E. Controller Size Heuristic & Zero Zombie Code
+- **Review heuristic (~65 lines)**: HTTP controllers should parse, validate, call an orchestrator, and return an envelope. Exceeding roughly 65 lines is a signal to inspect responsibility boundaries—not an automatic violation or hard cap.
 - **Zero Zombie Code**: Never commit commented-out code blocks (`// const oldQuery = ...`). Trust Git history.
 
 ### F. Boolean Naming Conventions
@@ -1030,7 +1030,7 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Do** use `assertNever(x)` in `default:` branches of switch statements for exhaustive compile-time verification.
 - **Do** explain *why* in comments, never *what* (no obvious restatements of code).
 - **Do** use guard clauses with early returns to keep the happy path completely flat against the left margin.
-- **Do** keep HTTP controllers under 65 lines of code, delegating domain logic to orchestrators.
+- **Do** keep HTTP controllers focused on transport concerns; use roughly 65 lines as an advisory review signal and delegate domain logic to orchestrators.
 - **Do** prefix boolean variables with active predicates (`isValid`, `hasPermission`, `canRetry`).
 
 ### ❌ DON'Ts:
@@ -1043,7 +1043,7 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Never** write redundant comments that state the obvious (`// get user by id: await getUserById()`).
 - **Never** nest logic 3+ levels deep inside `if/else` ladders (arrow code anti-pattern).
 - **Never** commit commented-out zombie code (`// const oldLogic = ...`). Rely on Git history.
-- **Never** allow controllers to grow beyond 65 lines of code.
+- **Don't** let business workflows or persistence logic accumulate in controllers; review unusually long handlers and refactor when it improves clarity.
 - **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
 - **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
 - **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.
