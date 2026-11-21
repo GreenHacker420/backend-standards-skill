@@ -1,56 +1,87 @@
 import { pipeline } from 'node:stream/promises';
-import { Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
+import readline from 'node:readline';
 import fs from 'node:fs';
 
 /**
  * Backpressured Stream Pipeline Example
  * 
  * Streams large files or datasets from disk/network without ballooning the Node.js V8 heap.
- * Supports both idiomatic Async Generators and safe Transform streams.
+ * Safely handles chunk boundaries, line framing, and multi-byte UTF-8 characters.
  */
 
-// Approach 1: Modern Idiomatic Node.js Async Generator Pipeline
-export async function streamWithAsyncGenerator(
+/**
+ * Approach 1: Line-by-Line Processing with node:readline
+ * 
+ * Recommended for line-oriented data (CSV, JSONL, logs).
+ * node:readline automatically handles line framing across arbitrary byte chunks,
+ * CRLF/LF normalization, and multi-byte UTF-8 character splitting.
+ */
+export async function streamLinesWithReadline(
   inputFilePath: string,
   outputFilePath: string,
-  processChunk: (line: string) => Promise<string>
+  processLine: (line: string) => Promise<string>
 ): Promise<void> {
-  async function* transformStage(source: AsyncIterable<Buffer>) {
+  const readStream = fs.createReadStream(inputFilePath);
+  const writeStream = fs.createWriteStream(outputFilePath);
+  const rl = readline.createInterface({
+    input: readStream,
+    crlfDelay: Infinity, // Normalizes \r\n and \n
+  });
+
+  try {
+    for await (const line of rl) {
+      const transformed = await processLine(line);
+      const canWrite = writeStream.write(transformed + '\n');
+      if (!canWrite) {
+        // Enforce backpressure when kernel write buffer is full
+        await new Promise((resolve) => writeStream.once('drain', resolve));
+      }
+    }
+  } finally {
+    writeStream.end();
+  }
+}
+
+/**
+ * Approach 2: Composable Async Generator Pipeline with StringDecoder
+ * 
+ * Uses StringDecoder to safely assemble UTF-8 characters and frames newline-delimited
+ * records across arbitrary stream chunk boundaries before processing.
+ */
+export async function streamLinesWithPipeline(
+  inputFilePath: string,
+  outputFilePath: string,
+  processLine: (line: string) => Promise<string>
+): Promise<void> {
+  async function* lineFramingStage(source: AsyncIterable<Buffer>) {
+    const decoder = new StringDecoder('utf8');
+    let remainder = '';
+
     for await (const chunk of source) {
-      const transformed = await processChunk(chunk.toString('utf8'));
-      yield Buffer.from(transformed, 'utf8');
+      // StringDecoder preserves incomplete multi-byte UTF-8 character bytes until next chunk
+      remainder += decoder.write(chunk);
+      const lines = remainder.split(/\r?\n/);
+      // Keep trailing incomplete fragment in remainder buffer
+      remainder = lines.pop() ?? '';
+
+      for (const line of lines) {
+        const transformed = await processLine(line);
+        yield Buffer.from(transformed + '\n', 'utf8');
+      }
+    }
+
+    remainder += decoder.end();
+    if (remainder.length > 0) {
+      const transformed = await processLine(remainder);
+      yield Buffer.from(transformed + '\n', 'utf8');
     }
   }
 
   // stream/promises pipeline handles backpressure and cleans up all descriptors on error
   await pipeline(
     fs.createReadStream(inputFilePath),
-    transformStage,
-    fs.createWriteStream(outputFilePath)
-  );
-}
-
-// Approach 2: Robust Transform Stream with Proper Error Handling
-export async function streamWithTransformStream(
-  inputFilePath: string,
-  outputFilePath: string,
-  transformChunk: (chunk: string) => string
-): Promise<void> {
-  const lineTransformer = new Transform({
-    transform(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null, data?: Buffer) => void) {
-      try {
-        const transformed = transformChunk(chunk.toString('utf8'));
-        callback(null, Buffer.from(transformed, 'utf8'));
-      } catch (err) {
-        // Enforces stream contract: errors must be passed to callback
-        callback(err instanceof Error ? err : new Error(String(err)));
-      }
-    },
-  });
-
-  await pipeline(
-    fs.createReadStream(inputFilePath),
-    lineTransformer,
+    lineFramingStage,
     fs.createWriteStream(outputFilePath)
   );
 }

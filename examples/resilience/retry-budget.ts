@@ -1,14 +1,18 @@
 /**
  * In-Process Token-Bucket Retry Budget Governor
  * 
- * Based on Google SRE and Finagle retry budget standards:
- * - Each regular initial request deposits fractional tokens into the bucket (e.g. 0.10 tokens = 10%).
- * - Retries withdraw 1.0 token.
+ * Implements a local token-bucket retry governor with a target retry ratio and burst capacity:
+ * - Each regular initial request deposits fractional tokens into the bucket (e.g. 0.10 tokens = 10% target retry ratio).
+ * - Retries withdraw 1.0 full token.
  * - If available tokens < 1.0, retries are forbidden and fail fast immediately.
+ * - Initial bootstrap tokens (10) and a small baseline replenishment (minRetriesPerSec = 1) permit legitimate retries
+ *   during cold start or low-traffic periods without starving transient recovery.
  * 
- * Multi-Instance Architecture Notice:
- * This implementation is an in-memory governor per Node.js process. In large distributed fleets,
- * either enforce retry budgets at the service mesh layer (Envoy/Linkerd) or back the token bucket with Redis.
+ * Fleet-Wide Governance Notice:
+ * This implementation is a process-local governor per Node.js instance. Because local buckets permit bursts and baseline
+ * refills, this provides an effective rate governor rather than a rigid mathematically strict 10% ceiling in every rolling second.
+ * When strict fleet-wide cross-pod quota enforcement is required across hundreds of microservices, enforce retry budgets
+ * at the service mesh layer (Envoy/Linkerd) or back the token bucket using an atomic Redis script.
  */
 
 export interface RetryBudgetOptions {

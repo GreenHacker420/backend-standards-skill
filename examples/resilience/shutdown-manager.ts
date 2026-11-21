@@ -106,19 +106,32 @@ export class ShutdownManager {
           logger.info('Redis closed.');
         }
 
-        clearTimeout(forceExitTimer);
-        logger.info('Graceful shutdown completed successfully.');
+        logger.info('Graceful shutdown resource cleanup completed successfully.');
 
-        // Step 6: Flush logger transports & pending telemetry buffers
+        // Step 6: Flush logger transports & pending telemetry buffers (AWAITED while emergency timer is still active!)
         if (logger.flush) {
-          await logger.flush();
+          try {
+            await logger.flush();
+          } catch (flushErr) {
+            // Keep going to exit even if log flush encounters a transport error
+          }
         }
 
+        // Only clear emergency fallback timer once ALL cleanup and telemetry flushing has completed
+        clearTimeout(forceExitTimer);
+
         // Node.js Best Practice: set exitCode and allow event loop to drain naturally
-        // process.exit() terminates immediately, potentially dropping pending stdout/stderr writes
         process.exitCode = 0;
       } catch (err) {
         logger.error('Error encountered during graceful shutdown:', err);
+        if (logger.flush) {
+          try {
+            await logger.flush();
+          } catch {
+            // Suppress flush error on exit path
+          }
+        }
+        clearTimeout(forceExitTimer);
         process.exit(1);
       }
     };

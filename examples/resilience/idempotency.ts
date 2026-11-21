@@ -10,8 +10,9 @@ export interface LoggerInterface {
 }
 
 export interface CacheIdempotencyOptions {
-    readonly ttlSeconds?: number;
-    readonly failClosed?: boolean; //! Invariant: If completion cannot be persisted, fail to avoid untracked mutations
+    readonly pendingTtlSeconds?: number;   //? Short lease for in-flight requests (default: 60s) preventing indefinite lockout on crash
+    readonly completedTtlSeconds?: number; //? Retention window for completed responses (default: 86400s / 24h)
+    readonly failClosed?: boolean;         //! Invariant: If completion cannot be persisted, fail to avoid untracked mutations
     readonly logger?: LoggerInterface;
 }
 
@@ -72,10 +73,24 @@ local raw = redis.call('GET', KEYS[1])
 if not raw then
     return 0
 end
-local record = cjson.decode(raw)
-if record.ownerToken == ARGV[1] then
+local cjson_ok, record = pcall(cjson.decode, raw)
+if cjson_ok and record and record.ownerToken == ARGV[1] then
     redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
     return 1
+else
+    return -1
+end
+`;
+
+//? Atomic Lua script to compare and delete pending lease only if owner token matches
+const COMPARE_AND_DELETE_LUA = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return 0
+end
+local cjson_ok, record = pcall(cjson.decode, raw)
+if cjson_ok and record and record.ownerToken == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
 else
     return -1
 end
@@ -89,7 +104,12 @@ end
  * Redis is an optional acceleration layer for rapid deduplication, not a substitute for ACID storage.
  */
 export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempotencyOptions = {}) {
-    const { ttlSeconds = 86400, failClosed = true, logger } = options;
+    const {
+        pendingTtlSeconds = 60,       // Short lease for pending execution (prevents 24h lockout on crash)
+        completedTtlSeconds = 86400,  // Full 24h retention for completed responses
+        failClosed = true,
+        logger,
+    } = options;
 
     return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
         const rawKey = req.header('Idempotency-Key');
@@ -124,11 +144,12 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                 fingerprint: currentFingerprint,
             };
 
+            // Acquire short pending lease (NX guarantees mutual exclusion)
             const acquired = await redis.set(
                 redisKey,
                 JSON.stringify(initialRecord),
                 'EX',
-                ttlSeconds,
+                pendingTtlSeconds,
                 'NX'
             );
 
@@ -155,7 +176,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                     return;
                 }
 
-                if (existingRecord.status === 'completed' && existingRecord.httpCode) {
+                if (existingRecord.status === 'completed' && typeof existingRecord.httpCode === 'number') {
                     res.setHeader('X-Cache-Lookup', 'HIT - Idempotent Replay');
                     res.status(existingRecord.httpCode).json(existingRecord.body);
                     return;
@@ -173,6 +194,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             // Hook response methods to capture body and await completion persistence
             const originalJson = res.json.bind(res);
             const originalSend = res.send.bind(res);
+            let responseHandled = false;
 
             const persistCompletion = async (statusCode: number, body: unknown): Promise<boolean> => {
                 try {
@@ -190,12 +212,12 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                             redisKey,
                             ownerToken,
                             JSON.stringify(record),
-                            ttlSeconds.toString()
+                            completedTtlSeconds.toString()
                         );
                         return result === 1;
                     } else {
-                        // Release lock on failure so client can retry with same key
-                        await redis.del(redisKey);
+                        // Compare-and-delete: only delete if THIS ownerToken still owns the key (prevents deleting next lease)
+                        await redis.eval(COMPARE_AND_DELETE_LUA, 1, redisKey, ownerToken);
                         return true;
                     }
                 } catch (persistErr) {
@@ -204,31 +226,36 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                 }
             };
 
-            res.json = (body: unknown): Response => {
+            const captureAndSend = (
+                body: unknown,
+                sender: (data: unknown) => Response,
+                isJson: boolean
+            ): Response => {
+                if (responseHandled) {
+                    return sender(body);
+                }
+                responseHandled = true;
+
                 void persistCompletion(res.statusCode, body).then((persisted) => {
-                    //! Fail-closed: If completion cannot be persisted in Redis, report 503 so client does not assume safe replay
+                    //! Fail-closed: If completion cannot be persisted in Redis, report 503 using unpatched sender
                     if (!persisted && failClosed && res.statusCode >= 200 && res.statusCode < 300) {
-                        res.status(503).json({
-                            error: true,
-                            message: 'Operation executed but idempotency confirmation failed. Contact support before retrying.',
-                        });
-                        return;
+                        res.status(503);
+                        if (isJson) {
+                            return originalJson({
+                                error: true,
+                                message: 'Operation executed but idempotency confirmation failed. Contact support before retrying.',
+                            });
+                        }
+                        return originalSend('Operation executed but idempotency confirmation failed.');
                     }
-                    originalJson(body);
+                    sender(body);
                 });
+
                 return res;
             };
 
-            res.send = (body: unknown): Response => {
-                void persistCompletion(res.statusCode, body).then((persisted) => {
-                    if (!persisted && failClosed && res.statusCode >= 200 && res.statusCode < 300) {
-                        res.status(503).send('Operation executed but idempotency confirmation failed.');
-                        return;
-                    }
-                    originalSend(body);
-                });
-                return res;
-            };
+            res.json = (body: unknown): Response => captureAndSend(body, originalJson, true);
+            res.send = (body: unknown): Response => captureAndSend(body, originalSend, false);
 
             next();
         } catch (err) {
@@ -290,11 +317,24 @@ export interface IdempotentExecutionResult<T> {
 /**
  * Executes a mission-critical business transaction inside PostgreSQL with durable idempotency.
  * Guarantees zero duplicate mutations and atomic state transitions under ACID guarantees.
+ * 
+ * Production Safety Rules:
+ * 1. Transactional Atomicity by Construction:
+ *    The `operation` callback MUST accept `tx` and execute all entity mutations through this
+ *    supplied transaction client, guaranteeing atomicity between business state and the idempotency record.
+ * 2. Unprotected Side Effects Prohibited:
+ *    NEVER perform non-transactional external side effects (e.g. charging a payment card, publishing
+ *    Kafka messages, external HTTP webhooks) directly inside `operation(tx)`. Use the Transactional
+ *    Outbox Pattern so side effects only dispatch after this database transaction commits.
+ * 3. Failure Rollback Semantics:
+ *    When `operation(tx)` throws an error, PostgreSQL aborts the entire interactive transaction.
+ *    Both partial business mutations and the PENDING idempotency record are cleanly rolled back,
+ *    freeing the key for safe subsequent retries without orphaned locks.
  */
 export async function executeWithDbIdempotency<T>(
     tx: DbTransactionClient,
     options: DbIdempotencyOptions,
-    operation: () => Promise<{ httpCode: number; body: T }>
+    operation: (tx: DbTransactionClient) => Promise<{ httpCode: number; body: T }>
 ): Promise<IdempotentExecutionResult<T>> {
     const { organizationId, scope, idempotencyKey, requestFingerprint, ttlMinutes = 1440 } = options;
 
@@ -340,11 +380,12 @@ export async function executeWithDbIdempotency<T>(
             throw new Error('Idempotency conflict: key was previously used with a different request payload.');
         }
 
-        if (existing.status === 'COMPLETED' && existing.http_code && existing.response_body) {
+        //? Fix: Safely replays valid responses with 204 No Content, null, false, 0, or empty string bodies
+        if (existing.status === 'COMPLETED' && typeof existing.http_code === 'number') {
             return {
                 isReplay: true,
                 httpCode: existing.http_code,
-                data: existing.response_body,
+                data: existing.response_body as T,
             };
         }
 
@@ -353,35 +394,23 @@ export async function executeWithDbIdempotency<T>(
         }
     }
 
-    // 3. Execute the core business operation
-    try {
-        const result = await operation();
+    // 3. Execute the core business operation passing tx to guarantee transactional binding
+    const result = await operation(tx);
 
-        // 4. Atomically persist COMPLETED state and response body within the same ACID transaction
-        await tx.$executeRaw`
-            UPDATE idempotency_records
-            SET status = 'COMPLETED',
-                http_code = ${result.httpCode},
-                response_body = ${JSON.stringify(result.body)}::jsonb
-            WHERE organization_id = ${organizationId}
-              AND scope = ${scope}
-              AND idempotency_key = ${idempotencyKey};
-        `;
+    // 4. Atomically persist COMPLETED state and response body within the same ACID transaction
+    await tx.$executeRaw`
+        UPDATE idempotency_records
+        SET status = 'COMPLETED',
+            http_code = ${result.httpCode},
+            response_body = ${JSON.stringify(result.body)}::jsonb
+        WHERE organization_id = ${organizationId}
+          AND scope = ${scope}
+          AND idempotency_key = ${idempotencyKey};
+    `;
 
-        return {
-            isReplay: false,
-            httpCode: result.httpCode,
-            data: result.body,
-        };
-    } catch (opError) {
-        // Mark FAILED so subsequent requests with the same key can retry cleanly
-        await tx.$executeRaw`
-            UPDATE idempotency_records
-            SET status = 'FAILED'
-            WHERE organization_id = ${organizationId}
-              AND scope = ${scope}
-              AND idempotency_key = ${idempotencyKey};
-        `;
-        throw opError;
-    }
+    return {
+        isReplay: false,
+        httpCode: result.httpCode,
+        data: result.body,
+    };
 }

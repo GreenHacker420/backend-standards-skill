@@ -572,14 +572,20 @@ export class APIError extends BaseError {
 // src/utils/retry.ts
 import { logger } from '@/shared/logger';
 
+export interface RetryBudget {
+    canRetry(): boolean;
+    recordAttempt(isRetry: boolean): void;
+}
+
 export interface RetryOptions {
     readonly retries?: number;
     readonly minDelayMs?: number;
     readonly maxDelayMs?: number;
     readonly factor?: number;
-    readonly jitter?: boolean;       //? When true, applies AWS Full Jitter to eliminate thundering herds
-    readonly isIdempotent?: boolean; //* Business Rule: Permits 1 cautious retry on HTTP 500 if mutation is idempotent
-    readonly shouldRetry?: (error: unknown, attempt: number) => boolean;
+    readonly jitter?: boolean;          //? When true, applies AWS Full Jitter to eliminate thundering herds
+    readonly isIdempotent?: boolean;    //! Invariant: Defaults to FALSE. Non-idempotent operations do NOT retry mid-flight network drops!
+    readonly retryBudget?: RetryBudget; // Local token-bucket retry governor
+    readonly shouldRetry?: (error: unknown, attempt: number, isIdempotent: boolean) => boolean;
     readonly onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
 }
 
@@ -598,27 +604,31 @@ export function extractRetryAfterMs(error: unknown): number | null {
 export function isTransientError(error: unknown, attempt: number, isIdempotent = false): boolean {
     if (!error || typeof error !== 'object') return false;
 
-    // 1. Database rollbacks (Always safe to retry)
+    // 1. Database & Socket Error Codes
     if ('code' in error) {
         const code = (error as { code?: string }).code;
-        const dbRollbackCodes = new Set(['40P01', '40001', 'P2034', 'P1001', 'P1002', 'P1017', 'P2024']);
+
+        // Definitely rolled back by PostgreSQL (zero committed side effects)
+        const dbRollbackCodes = new Set(['40P01', '40001', 'P2034']);
         if (code && dbRollbackCodes.has(code)) return true;
 
-        // Connection refused before sending request
-        if (code === 'ECONNREFUSED' || code === 'ENOTFOUND') return true;
+        // Pre-query failures (query never reached or began execution on the database engine)
+        const preQueryCodes = new Set(['P1001', 'P2024', 'ECONNREFUSED', 'ENOTFOUND']);
+        if (code && preQueryCodes.has(code)) return true;
 
-        // Mid-flight drops (Hazard: mutation may have processed; ONLY retry if idempotent!)
-        const midFlightCodes = new Set([
-            'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN', 'EPIPE',
+        // Mid-flight drops & timeouts (Execution outcome uncertain; server may have committed!)
+        const uncertainCodes = new Set([
+            'P1002', 'P1017', 'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN', 'EPIPE',
             'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
         ]);
-        if (code && midFlightCodes.has(code)) return isIdempotent;
+        if (code && uncertainCodes.has(code)) return isIdempotent;
     }
 
     // 2. HTTP Status Codes
     if ('response' in error && error.response && typeof error.response === 'object') {
         const status = (error.response as { status?: number }).status;
-        if (status === 429 || status === 503) return true;
+        if (status === 429) return true;
+        if (status === 503) return isIdempotent; // Origin may have partially executed; retry only if idempotent
         if (status === 502 || status === 504) return isIdempotent; // Origin may have executed; retry only if idempotent
         if (status === 500 && isIdempotent && attempt === 1) return true;
         if (status !== undefined && status >= 400 && status < 500) return false;
@@ -638,7 +648,8 @@ export async function withRetry<T>(
         factor = 2,
         jitter = true,
         isIdempotent = false,
-        shouldRetry = (err, att) => isTransientError(err, att, isIdempotent),
+        retryBudget,
+        shouldRetry,
         onRetry,
     } = options;
 
@@ -646,24 +657,47 @@ export async function withRetry<T>(
 
     while (true) {
         try {
+            retryBudget?.recordAttempt(attempt > 0);
             return await operation();
         } catch (error) {
             attempt++;
-            if (attempt > retries || !shouldRetry(error, attempt)) {
+
+            // 1. Mandatory Safety Check: Base transient invariants cannot be bypassed by custom policies
+            const isSafe = isTransientError(error, attempt, isIdempotent);
+            if (attempt > retries || !isSafe) {
                 throw error;
             }
 
-            //? Bounded exponential ceiling
+            // Custom policy can further restrict retries, but cannot override mandatory safety
+            if (shouldRetry && !shouldRetry(error, attempt, isIdempotent)) {
+                throw error;
+            }
+
+            // 2. Check retry budget capacity if configured
+            if (retryBudget && !retryBudget.canRetry()) {
+                logger.warn('[Retry] Retry budget exhausted; failing fast to prevent cascading failure.');
+                throw new Error('[RetryBudgetExhausted] Downstream service degraded. Retry quota depleted.', {
+                    cause: error,
+                });
+            }
+
+            // 3. Bounded exponential ceiling
             const ceiling = Math.min(maxDelayMs, minDelayMs * Math.pow(factor, attempt - 1));
 
-            //? AWS Full Jitter: Uniform random distribution between 0 and ceiling
+            // 4. AWS Full Jitter: Uniform random distribution between 0 and ceiling
             let delay = jitter ? Math.random() * ceiling : ceiling;
 
-            //? Honor upstream Retry-After with jitter smoothing
+            // 5. Honor upstream Retry-After (fail fast if wait exceeds maxDelayMs)
             const retryAfterMs = extractRetryAfterMs(error);
             if (retryAfterMs !== null) {
-                const bounded = Math.min(maxDelayMs, retryAfterMs);
-                delay = jitter ? bounded + Math.random() * Math.min(1000, bounded * 0.1) : bounded;
+                if (retryAfterMs > maxDelayMs) {
+                    logger.warn('[Retry] Upstream Retry-After exceeds maxDelayMs; aborting retries.', {
+                        retryAfterMs,
+                        maxDelayMs,
+                    });
+                    throw error;
+                }
+                delay = jitter ? retryAfterMs + Math.random() * Math.min(1000, retryAfterMs * 0.1) : retryAfterMs;
             }
 
             if (onRetry) {
@@ -674,6 +708,7 @@ export async function withRetry<T>(
                     retries,
                     delayMs: Math.round(delay),
                     jitter,
+                    isIdempotent,
                 });
             }
 
@@ -684,10 +719,10 @@ export async function withRetry<T>(
 ```
 
 ### Advanced Failure Recovery: Token-Bucket Retry Budget & Full Jitter
-To prevent cascading retry storms where layered services multiply retries ($3 \times 3 \times 3 = 27\times$ load), enforce Google SRE retry budgets:
-1. Retries must never exceed **10% of total outbound requests** in any 60-second window.
-2. Use **Full Jitter** (`random(0, min(cap, base * 2^attempt))`) so clients do not retry in synchronized waves.
-3. See `examples/resilience/retry-budget.ts` for the full implementation.
+To prevent cascading retry storms where layered services multiply retries ($3 \times 3 \times 3 = 27\times$ load):
+1. **Local Token-Bucket Retry Governor**: Use a local token-bucket governor with a target retry ratio (e.g. 10%) and burst capacity to limit retry volume per instance. For fleet-wide enforcement across hundreds of nodes, back the governor with an atomic Redis script or enforce budgets at the service mesh layer (Envoy/Linkerd).
+2. **Full Jitter**: Apply AWS Full Jitter (`random(0, min(cap, base * 2^attempt))`) so retrying clients do not synchronize in periodic thundering-herd waves.
+3. See `examples/resilience/retry-budget.ts` and `examples/resilience/retry.ts` for the complete standalone reference implementations.
 
 ### Strict Error Classification Matrix
 
@@ -793,8 +828,24 @@ function computeRequestFingerprint(req: Request): string {
     return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
-export function cacheIdempotencyMiddleware(options: { ttlSeconds?: number; failClosed?: boolean } = {}) {
-    const { ttlSeconds = 86400, failClosed = true } = options;
+//? Atomic Lua script to compare and delete pending lease only if owner token matches
+const COMPARE_AND_DELETE_LUA = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local cjson_ok, record = pcall(cjson.decode, raw)
+if cjson_ok and record and record.ownerToken == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return -1
+end
+`;
+
+export function cacheIdempotencyMiddleware(options: {
+    pendingTtlSeconds?: number;
+    completedTtlSeconds?: number;
+    failClosed?: boolean;
+} = {}) {
+    const { pendingTtlSeconds = 60, completedTtlSeconds = 86400, failClosed = true } = options;
 
     return async (req: Request, res: Response, next: NextFunction) => {
         const rawKey = req.header('Idempotency-Key');
@@ -818,9 +869,9 @@ export function cacheIdempotencyMiddleware(options: { ttlSeconds?: number; failC
         const redis = getRedisConnection('cache');
 
         try {
-            // 3. Atomic lock acquisition with pending status and lease ownership token
+            // 3. Acquire short pending lease (prevents 24h lockout if server crashes mid-mutation)
             const initialRecord = { status: 'pending', ownerToken, fingerprint: currentFingerprint };
-            const acquired = await redis.set(redisKey, JSON.stringify(initialRecord), 'EX', ttlSeconds, 'NX');
+            const acquired = await redis.set(redisKey, JSON.stringify(initialRecord), 'EX', pendingTtlSeconds, 'NX');
             
             if (!acquired) {
                 const existing = await redis.get(redisKey);
@@ -837,7 +888,7 @@ export function cacheIdempotencyMiddleware(options: { ttlSeconds?: number; failC
                     return sendError(res, 'Idempotency key reused with a different request payload or parameters.', 422);
                 }
 
-                if (parsed.status === 'completed' && parsed.httpCode) {
+                if (parsed.status === 'completed' && typeof parsed.httpCode === 'number') {
                     res.setHeader('X-Cache-Lookup', 'HIT - Idempotent Replay');
                     return res.status(parsed.httpCode).json(parsed.body);
                 }
@@ -849,6 +900,7 @@ export function cacheIdempotencyMiddleware(options: { ttlSeconds?: number; failC
             // 4. Intercept and AWAIT persistence before sending HTTP response
             const originalJson = res.json.bind(res);
             const originalSend = res.send.bind(res);
+            let responseHandled = false;
 
             const persistResponse = async (statusCode: number, body: unknown) => {
                 try {
@@ -857,29 +909,29 @@ export function cacheIdempotencyMiddleware(options: { ttlSeconds?: number; failC
                             redisKey,
                             JSON.stringify({ status: 'completed', ownerToken, httpCode: statusCode, fingerprint: currentFingerprint, body }),
                             'EX',
-                            ttlSeconds,
+                            completedTtlSeconds,
                         );
                     } else {
-                        await redis.del(redisKey);
+                        // Compare-and-delete: only delete if THIS ownerToken still owns the key (prevents deleting next lease)
+                        await redis.eval(COMPARE_AND_DELETE_LUA, 1, redisKey, ownerToken);
                     }
                 } catch (persistErr) {
                     logger.error('[Idempotency] Failed to persist completion state:', persistErr);
                 }
             };
 
-            res.json = (body: unknown): Response => {
+            const captureAndSend = (body: unknown, sender: (data: unknown) => Response, isJson: boolean): Response => {
+                if (responseHandled) return sender(body);
+                responseHandled = true;
+
                 void persistResponse(res.statusCode, body).then(() => {
-                    originalJson(body);
+                    sender(body);
                 });
                 return res;
             };
 
-            res.send = (body: unknown): Response => {
-                void persistResponse(res.statusCode, body).then(() => {
-                    originalSend(body);
-                });
-                return res;
-            };
+            res.json = (body: unknown): Response => captureAndSend(body, originalJson, true);
+            res.send = (body: unknown): Response => captureAndSend(body, originalSend, false);
 
             next();
         } catch (err) {
@@ -892,7 +944,7 @@ export function cacheIdempotencyMiddleware(options: { ttlSeconds?: number; failC
     };
 }
 ```
-*For high-value financial transactions, prefer a durable PostgreSQL database-backed `idempotency_keys` table with a unique constraint on `(tenant_id, scope, idempotency_key)` and transactional state transitions (`PENDING` $\to$ `COMPLETED`).*
+*For high-value financial transactions, use the durable PostgreSQL implementation (`executeWithDbIdempotency` in `examples/resilience/idempotency.ts`). It guarantees transactional safety by construction: `operation(tx)` receives the transaction client `tx`, binds mutations and idempotency records within the same ACID boundary, and safely replays 204 No Content/null/empty responses without risk of duplicate execution.*
 
 ### Pattern B: Transactional Outbox Pattern
 ```typescript
@@ -971,16 +1023,30 @@ class ShutdownManager {
                 if (global._redis_connection) await global._redis_connection.quit();
                 logger.info('Redis connections closed.');
 
-                clearTimeout(forceExitTimer);
-                logger.info('Graceful shutdown completed successfully.');
+                logger.info('Graceful shutdown resource cleanup completed successfully.');
 
-                // Step 6: Flush logger transports & pending telemetry buffers
-                if (logger.flush) await logger.flush();
+                // Step 6: Flush logger transports & pending telemetry buffers while emergency timer is still active!
+                if (logger.flush) {
+                    try {
+                        await logger.flush();
+                    } catch {
+                        // Suppress flush error on shutdown
+                    }
+                }
+
+                // Only clear emergency fallback timer once ALL cleanup and telemetry flushing has completed
+                clearTimeout(forceExitTimer);
 
                 // Set exitCode and allow event loop to drain naturally (zero abruptly dropped logs)
                 process.exitCode = 0;
             } catch (err) {
                 logger.error('Error during shutdown:', err);
+                if (logger.flush) {
+                    try {
+                        await logger.flush();
+                    } catch {}
+                }
+                clearTimeout(forceExitTimer);
                 process.exit(1);
             }
         };
@@ -1231,24 +1297,37 @@ export function verifySignature(received: string, expected: string): boolean {
 ```
 
 ### B. Backpressured Stream Pipelines (OOM Prevention)
-Never load large CSVs, audio files, or PDF reports into memory via `fs.readFileSync` or accumulators (`records.push(row)`). An unbounded 50MB file expands in V8 memory and triggers `JavaScript heap out of memory`. Use `stream.pipeline` with Async Generators to enforce backpressure:
+Never load large CSVs, audio files, or PDF reports into memory via `fs.readFileSync` or accumulators (`records.push(row)`). An unbounded 50MB file expands in V8 memory and triggers `JavaScript heap out of memory`. Use `stream.pipeline` with explicit line framing to handle arbitrary chunk boundaries and multi-byte UTF-8 characters:
 
 ```typescript
 // See examples/safety/streaming-pipeline.ts
 import { pipeline } from 'node:stream/promises';
+import { StringDecoder } from 'node:string_decoder';
 import fs from 'node:fs';
 
-async function* transformStage(source: AsyncIterable<Buffer>) {
+async function* lineFramingStage(source: AsyncIterable<Buffer>) {
+    const decoder = new StringDecoder('utf8');
+    let remainder = '';
     for await (const chunk of source) {
-        const transformed = await processChunk(chunk.toString('utf8'));
-        yield Buffer.from(transformed, 'utf8');
+        // Preserves incomplete multi-byte UTF-8 character bytes across stream chunks
+        remainder += decoder.write(chunk);
+        const lines = remainder.split(/\r?\n/);
+        remainder = lines.pop() ?? ''; // Buffer incomplete trailing line fragment
+        for (const line of lines) {
+            const transformed = await processLine(line);
+            yield Buffer.from(transformed + '\n', 'utf8');
+        }
+    }
+    remainder += decoder.end();
+    if (remainder.length > 0) {
+        yield Buffer.from((await processLine(remainder)) + '\n', 'utf8');
     }
 }
 
 // Automatically manages backpressure and safely closes file handles on error
 await pipeline(
     fs.createReadStream(inputFilePath),
-    transformStage,
+    lineFramingStage,
     fs.createWriteStream(outputFilePath)
 );
 ```
@@ -1262,8 +1341,8 @@ await prisma.$transaction(async (tx) => {
     // 1. Set transaction-local timeout via set_config (prepared statements reject dynamic SET LOCAL)
     await tx.$queryRaw`SELECT set_config('lock_timeout', '5000ms', TRUE)`;
 
-    // 2. Derive 64-bit BigInt (avoids 32-bit hashtext collisions and JS float precision loss)
-    const safeLockId = typeof entityId === 'bigint' ? entityId : BigInt(entityId);
+    // 2. Safe 64-bit integer conversion (rejects unsafe floats; 64-bit SHA-256 substantially reduces collision probability)
+    const safeLockId = toSafeLockId(entityId); // or hashStringToLockId(semanticKey)
     await tx.$queryRaw`SELECT pg_advisory_xact_lock(${safeLockId})`;
 
     await performSensitiveMutation(tx);
@@ -1311,7 +1390,8 @@ export async function executeTenantTransaction<T>(
 ): Promise<T> {
     return prisma.$transaction(async (tx) => {
         // Third argument (is_local = TRUE) binds setting strictly to this transaction, preventing pool leakage
-        await tx.$executeRaw`SELECT set_config('app.current_org_id', ${organizationId.toString()}, TRUE)`;
+        // Prisma Rule: SELECT set_config returns a row, so $queryRaw must be used (not $executeRaw)
+        await tx.$queryRaw`SELECT set_config('app.current_org_id', ${organizationId.toString()}, TRUE)`;
         return await task(tx);
     });
 }

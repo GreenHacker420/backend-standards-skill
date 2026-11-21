@@ -34,38 +34,48 @@ export function createCostRateLimiter(redis: RedisClient) {
     const { windowSeconds, maxPoints, costCalculator = () => 1 } = options;
 
     return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-      // Validate cost as a finite, positive integer (prevents NaN, Infinity, negative values)
-      const rawCost = costCalculator(req);
-      const cost = Number.isInteger(rawCost) && rawCost > 0 ? rawCost : 1;
+      try {
+        //? Fail-closed validation: Reject NaN, float, 0, or negative costs instead of silently defaulting to cheapest cost
+        const rawCost = costCalculator(req);
+        if (!Number.isInteger(rawCost) || rawCost <= 0) {
+          throw new TypeError(
+            `[CostRateLimiter] Invalid rate limit cost calculated: ${String(rawCost)}. Cost must be a positive integer.`
+          );
+        }
+        const cost = rawCost;
 
-      const orgId = req.currentOrganizationUser?.organizationId;
-      const clientKey = orgId
-        ? `ratelimit:org:${orgId}`
-        : `ratelimit:ip:${req.ip || 'unknown'}`;
+        const orgId = req.currentOrganizationUser?.organizationId;
+        const clientKey = orgId
+          ? `ratelimit:org:${orgId}`
+          : `ratelimit:ip:${req.ip || 'unknown'}`;
 
-      // Atomic execution: increments counter and binds TTL in a single Redis transaction
-      const currentPoints = await redis.eval(
-        ATOMIC_COST_LIMITER_LUA,
-        1,
-        clientKey,
-        cost,
-        windowSeconds
-      );
+        // Atomic execution: increments counter and binds TTL in a single Redis transaction
+        const currentPoints = await redis.eval(
+          ATOMIC_COST_LIMITER_LUA,
+          1,
+          clientKey,
+          cost,
+          windowSeconds
+        );
 
-      res.setHeader('X-RateLimit-Limit', maxPoints);
-      res.setHeader('X-RateLimit-Remaining', Math.max(0, maxPoints - currentPoints));
+        res.setHeader('X-RateLimit-Limit', maxPoints);
+        res.setHeader('X-RateLimit-Remaining', Math.max(0, maxPoints - currentPoints));
 
-      if (currentPoints > maxPoints) {
-        res.setHeader('Retry-After', windowSeconds);
-        res.status(429).json({
-          success: false,
-          message: 'Rate limit exceeded. Please slow down your requests.',
-          details: { costIncurred: cost, retryAfter: windowSeconds },
-        });
-        return;
+        if (currentPoints > maxPoints) {
+          res.setHeader('Retry-After', windowSeconds);
+          res.status(429).json({
+            success: false,
+            message: 'Rate limit exceeded. Please slow down your requests.',
+            details: { costIncurred: cost, retryAfter: windowSeconds },
+          });
+          return;
+        }
+
+        next();
+      } catch (err) {
+        // Explicit async error propagation for Express 4 and Express 5 compatibility
+        next(err);
       }
-
-      next();
     };
   };
 }

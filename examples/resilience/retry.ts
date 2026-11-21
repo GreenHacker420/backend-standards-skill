@@ -55,43 +55,48 @@ export function extractRetryAfterMs(error: unknown): number | null {
 }
 
 /**
- * Evaluates whether an error is safe to retry.
+ * Evaluates whether an error represents a safe, transient failure eligible for retry.
  * 
  * Strict Production Safety Rules:
  * 1. Database deadlocks (40P01) and serialization conflicts (40001, P2034) are ALWAYS safe
  *    to retry because PostgreSQL aborted the transaction with zero side-effects.
- * 2. Connection-establishment failures (ECONNREFUSED, ENOTFOUND) are safe because
- *    the remote server never received the packet.
- * 3. Mid-flight network drops (ECONNRESET, ETIMEDOUT, 502, 504) are ONLY retried if
- *    isIdempotent === true. Retrying non-idempotent mutations risks duplicate payments/orders!
+ * 2. Pre-query connection failures (P1001, P2024, ECONNREFUSED, ENOTFOUND) are safe because
+ *    the engine never received or began executing the operation.
+ * 3. Uncertain mid-query database drops (P1002, P1017) and network drops (ECONNRESET, ETIMEDOUT, 502, 503, 504) are ONLY retried if
+ *    isIdempotent === true. Retrying non-idempotent mutations on uncertain outcomes risks duplicate charges/orders!
  * 4. 4xx Client Errors (400, 401, 403, 404, 422) must NEVER be retried.
  */
 export function isTransientError(error: unknown, attempt: number, isIdempotent: boolean): boolean {
     if (!error || typeof error !== 'object') return false;
     const err = error as ErrorWithResponse;
 
-    // 1. Database rollbacks (Always safe to retry)
+    // 1. Database & Socket Error Codes
     if (err.code) {
+        // Definitely rolled back by PostgreSQL (zero committed side effects)
         const dbRollbackCodes = new Set([
-            '40P01', // PostgreSQL deadlock detected (transaction rolled back)
-            '40001', // PostgreSQL serialization failure (transaction rolled back)
+            '40P01', // PostgreSQL deadlock detected (transaction aborted)
+            '40001', // PostgreSQL serialization failure (transaction aborted)
             'P2034', // Prisma transaction failed due to write conflict/deadlock
-            'P1001', // Can't reach database server
-            'P1002', // Database server timed out
-            'P1017', // Server closed connection
-            'P2024', // Timed out fetching a connection from the pool
         ]);
         if (dbRollbackCodes.has(err.code)) {
             return true;
         }
 
-        // Connection-refused (request never reached remote host)
-        if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+        // Pre-query failures (query never reached or began execution on the database engine)
+        const preQueryCodes = new Set([
+            'P1001', // Cannot reach database server
+            'P2024', // Timed out fetching a connection from the pool
+            'ECONNREFUSED',
+            'ENOTFOUND',
+        ]);
+        if (preQueryCodes.has(err.code)) {
             return true;
         }
 
-        // Mid-flight drops (ONLY safe if mutation is idempotent)
-        const midFlightCodes = new Set([
+        // Mid-flight drops & timeouts (Execution outcome uncertain; server may have committed!)
+        const uncertainCodes = new Set([
+            'P1002', // Database server timed out mid-query
+            'P1017', // Server closed connection mid-query
             'ECONNRESET',
             'ETIMEDOUT',
             'ECONNABORTED',
@@ -101,8 +106,8 @@ export function isTransientError(error: unknown, attempt: number, isIdempotent: 
             'UND_ERR_CONNECT_TIMEOUT',
             'UND_ERR_HEADERS_TIMEOUT',
         ]);
-        if (midFlightCodes.has(err.code)) {
-            //! SAFETY INVARIANT: If not idempotent, a dropped connection may have already executed upstream!
+        if (uncertainCodes.has(err.code)) {
+            //! SAFETY INVARIANT: If not idempotent, an uncertain drop may have already committed upstream!
             return isIdempotent;
         }
     }
@@ -116,9 +121,10 @@ export function isTransientError(error: unknown, attempt: number, isIdempotent: 
             return true;
         }
 
-        // 503 Service Unavailable: upstream declared itself overloaded before processing
+        // 503 Service Unavailable: origin may have partially processed or timed out.
+        // Requires an explicit idempotency guarantee before retrying!
         if (status === 503) {
-            return true;
+            return isIdempotent;
         }
 
         // 502 Bad Gateway / 504 Gateway Timeout: upstream proxy timed out waiting for origin.
@@ -157,7 +163,7 @@ export async function withRetry<T>(
         isIdempotent = false, //! Default: NOT idempotent. Non-idempotent operations will not retry dropped responses!
         retryBudget,
         logger,
-        shouldRetry = (err, att, idemp) => isTransientError(err, att, idemp),
+        shouldRetry,
         onRetry,
     } = options;
 
@@ -170,8 +176,14 @@ export async function withRetry<T>(
         } catch (error) {
             attempt++;
             
-            // 1. Check max retries & transient safety
-            if (attempt > retries || !shouldRetry(error, attempt, isIdempotent)) {
+            // 1. Mandatory safety check: Base transient invariants cannot be bypassed by custom policies
+            const isSafe = isTransientError(error, attempt, isIdempotent);
+            if (attempt > retries || !isSafe) {
+                throw error;
+            }
+
+            // Custom policy can further restrict retries, but cannot override mandatory safety
+            if (shouldRetry && !shouldRetry(error, attempt, isIdempotent)) {
                 throw error;
             }
 
@@ -192,10 +204,18 @@ export async function withRetry<T>(
             // 5. Honor remote Retry-After header with optional jitter smoothing
             const retryAfterMs = extractRetryAfterMs(error);
             if (retryAfterMs !== null) {
-                const boundedRetryAfter = Math.min(maxDelayMs, retryAfterMs);
+                //? Do NOT shorten the provider's requested wait; hammering an overloaded service earlier than instructed violates backoff.
+                //? If the requested wait exceeds maxDelayMs, fail fast immediately.
+                if (retryAfterMs > maxDelayMs) {
+                    logger?.warn('[Retry] Upstream Retry-After exceeds maxDelayMs; aborting retry to avoid violating upstream backoff.', {
+                        retryAfterMs,
+                        maxDelayMs,
+                    });
+                    throw error;
+                }
                 delay = jitter
-                    ? boundedRetryAfter + Math.random() * Math.min(1000, boundedRetryAfter * 0.1)
-                    : boundedRetryAfter;
+                    ? retryAfterMs + Math.random() * Math.min(1000, retryAfterMs * 0.1)
+                    : retryAfterMs;
             }
 
             // 6. Notify observers or emit structured telemetry log

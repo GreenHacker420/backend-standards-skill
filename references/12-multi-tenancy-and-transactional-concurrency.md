@@ -40,8 +40,8 @@ export async function executeTenantTransaction<T>(
 ): Promise<T> {
   return prisma.$transaction(async (tx) => {
     //? The 3rd parameter (is_local = TRUE) binds the setting strictly to THIS transaction.
-    //? When the transaction commits or aborts, the setting resets immediately.
-    await tx.$executeRaw`SELECT set_config('app.current_org_id', ${organizationId.toString()}, TRUE)`;
+    //? Prisma Rule: SELECT set_config returns a record, so $queryRaw must be used (not $executeRaw).
+    await tx.$queryRaw`SELECT set_config('app.current_org_id', ${organizationId.toString()}, TRUE)`;
 
     return await task(tx);
   });
