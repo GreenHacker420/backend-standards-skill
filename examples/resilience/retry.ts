@@ -16,9 +16,10 @@ export interface RetryOptions {
     readonly minDelayMs?: number;
     readonly maxDelayMs?: number;
     readonly factor?: number;
-    readonly jitter?: boolean;          //? When true, applies AWS Full Jitter to eliminate thundering herds
-    readonly isIdempotent?: boolean;    //! CRITICAL INVARIANT: Defaults to FALSE. Mid-flight network drops (ECONNRESET, ETIMEDOUT, 502, 504) are NOT retried unless isIdempotent is true!
-    readonly retryBudget?: RetryBudget; // Optional token bucket governor
+    readonly jitter?: boolean;                    //? When true, applies AWS Full Jitter to eliminate thundering herds
+    readonly isIdempotent?: boolean;              //! CRITICAL INVARIANT: Defaults to FALSE. Non-idempotent operations will NOT retry dropped responses, 429, 502, 503, or 504!
+    readonly isDatabaseOnlyTransaction?: boolean; //? When true, affirms operation has zero external side-effects so DB deadlocks (40P01/40001/P2034) are safe to retry even if isIdempotent is false
+    readonly retryBudget?: RetryBudget;           // Optional token bucket governor
     readonly logger?: LoggerInterface;
     readonly shouldRetry?: (error: unknown, attempt: number, isIdempotent: boolean) => boolean;
     readonly onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
@@ -58,28 +59,35 @@ export function extractRetryAfterMs(error: unknown): number | null {
  * Evaluates whether an error represents a safe, transient failure eligible for retry.
  * 
  * Strict Production Safety Rules:
- * 1. Database deadlocks (40P01) and serialization conflicts (40001, P2034) are ALWAYS safe
- *    to retry because PostgreSQL aborted the transaction with zero side-effects.
+ * 1. Database deadlocks (40P01) and serialization conflicts (40001, P2034) are safe to retry
+ *    if the operation is marked `isIdempotent: true` OR `isDatabaseOnlyTransaction: true`.
+ *    If an operation performs external side-effects (e.g. notifications, payment calls) before/around
+ *    the database transaction, retrying upon DB deadlock repeats those external effects!
  * 2. Pre-query connection failures (P1001, P2024, ECONNREFUSED, ENOTFOUND) are safe because
  *    the engine never received or began executing the operation.
- * 3. Uncertain mid-query database drops (P1002, P1017) and network drops (ECONNRESET, ETIMEDOUT, 502, 503, 504) are ONLY retried if
- *    isIdempotent === true. Retrying non-idempotent mutations on uncertain outcomes risks duplicate charges/orders!
+ * 3. Uncertain mid-query database drops (P1002, P1017), HTTP 429 (RFC 6585 permits upstream work prior to 429),
+ *    and network drops (ECONNRESET, ETIMEDOUT, 502, 503, 504) are ONLY retried if `isIdempotent === true`.
  * 4. 4xx Client Errors (400, 401, 403, 404, 422) must NEVER be retried.
  */
-export function isTransientError(error: unknown, attempt: number, isIdempotent: boolean): boolean {
+export function isTransientError(
+    error: unknown,
+    attempt: number,
+    isIdempotent: boolean,
+    isDatabaseOnlyTransaction = false
+): boolean {
     if (!error || typeof error !== 'object') return false;
     const err = error as ErrorWithResponse;
 
     // 1. Database & Socket Error Codes
     if (err.code) {
-        // Definitely rolled back by PostgreSQL (zero committed side effects)
+        // Database deadlocks/serialization conflicts: Safe only if idempotent OR isolated DB-only transaction
         const dbRollbackCodes = new Set([
             '40P01', // PostgreSQL deadlock detected (transaction aborted)
             '40001', // PostgreSQL serialization failure (transaction aborted)
             'P2034', // Prisma transaction failed due to write conflict/deadlock
         ]);
         if (dbRollbackCodes.has(err.code)) {
-            return true;
+            return isIdempotent || isDatabaseOnlyTransaction;
         }
 
         // Pre-query failures (query never reached or began execution on the database engine)
@@ -116,9 +124,10 @@ export function isTransientError(error: unknown, attempt: number, isIdempotent: 
     if (err.response?.status !== undefined) {
         const status = err.response.status;
         
-        // Rate limited: always safe because request was rejected before execution
+        // 429 Too Many Requests: RFC 6585 does not guarantee zero partial execution upstream prior to rate limiting.
+        // Requires an explicit idempotency guarantee before retrying!
         if (status === 429) {
-            return true;
+            return isIdempotent;
         }
 
         // 503 Service Unavailable: origin may have partially processed or timed out.
@@ -161,6 +170,7 @@ export async function withRetry<T>(
         factor = 2,
         jitter = true,
         isIdempotent = false, //! Default: NOT idempotent. Non-idempotent operations will not retry dropped responses!
+        isDatabaseOnlyTransaction = false,
         retryBudget,
         logger,
         shouldRetry,
@@ -177,7 +187,7 @@ export async function withRetry<T>(
             attempt++;
             
             // 1. Mandatory safety check: Base transient invariants cannot be bypassed by custom policies
-            const isSafe = isTransientError(error, attempt, isIdempotent);
+            const isSafe = isTransientError(error, attempt, isIdempotent, isDatabaseOnlyTransaction);
             if (attempt > retries || !isSafe) {
                 throw error;
             }

@@ -582,9 +582,10 @@ export interface RetryOptions {
     readonly minDelayMs?: number;
     readonly maxDelayMs?: number;
     readonly factor?: number;
-    readonly jitter?: boolean;          //? When true, applies AWS Full Jitter to eliminate thundering herds
-    readonly isIdempotent?: boolean;    //! Invariant: Defaults to FALSE. Non-idempotent operations do NOT retry mid-flight network drops!
-    readonly retryBudget?: RetryBudget; // Local token-bucket retry governor
+    readonly jitter?: boolean;                    //? When true, applies AWS Full Jitter to eliminate thundering herds
+    readonly isIdempotent?: boolean;              //! Invariant: Defaults to FALSE. Non-idempotent operations will NOT retry dropped responses, 429, 502, 503, or 504!
+    readonly isDatabaseOnlyTransaction?: boolean; //? When true, affirms operation has zero external side-effects so DB deadlocks (40P01/40001/P2034) are safe to retry even if isIdempotent is false
+    readonly retryBudget?: RetryBudget;           // Local token-bucket retry governor
     readonly shouldRetry?: (error: unknown, attempt: number, isIdempotent: boolean) => boolean;
     readonly onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
 }
@@ -601,16 +602,21 @@ export function extractRetryAfterMs(error: unknown): number | null {
     return !Number.isNaN(dateMs) && dateMs > Date.now() ? dateMs - Date.now() : null;
 }
 
-export function isTransientError(error: unknown, attempt: number, isIdempotent = false): boolean {
+export function isTransientError(
+    error: unknown,
+    attempt: number,
+    isIdempotent = false,
+    isDatabaseOnlyTransaction = false
+): boolean {
     if (!error || typeof error !== 'object') return false;
 
     // 1. Database & Socket Error Codes
     if ('code' in error) {
         const code = (error as { code?: string }).code;
 
-        // Definitely rolled back by PostgreSQL (zero committed side effects)
+        // Database deadlocks/serialization conflicts: Safe only if idempotent OR isolated DB-only transaction
         const dbRollbackCodes = new Set(['40P01', '40001', 'P2034']);
-        if (code && dbRollbackCodes.has(code)) return true;
+        if (code && dbRollbackCodes.has(code)) return isIdempotent || isDatabaseOnlyTransaction;
 
         // Pre-query failures (query never reached or began execution on the database engine)
         const preQueryCodes = new Set(['P1001', 'P2024', 'ECONNREFUSED', 'ENOTFOUND']);
@@ -627,7 +633,7 @@ export function isTransientError(error: unknown, attempt: number, isIdempotent =
     // 2. HTTP Status Codes
     if ('response' in error && error.response && typeof error.response === 'object') {
         const status = (error.response as { status?: number }).status;
-        if (status === 429) return true;
+        if (status === 429) return isIdempotent; // RFC 6585 permits upstream work prior to rate limit; retry only if idempotent
         if (status === 503) return isIdempotent; // Origin may have partially executed; retry only if idempotent
         if (status === 502 || status === 504) return isIdempotent; // Origin may have executed; retry only if idempotent
         if (status === 500 && isIdempotent && attempt === 1) return true;
@@ -648,6 +654,7 @@ export async function withRetry<T>(
         factor = 2,
         jitter = true,
         isIdempotent = false,
+        isDatabaseOnlyTransaction = false,
         retryBudget,
         shouldRetry,
         onRetry,
@@ -663,7 +670,7 @@ export async function withRetry<T>(
             attempt++;
 
             // 1. Mandatory Safety Check: Base transient invariants cannot be bypassed by custom policies
-            const isSafe = isTransientError(error, attempt, isIdempotent);
+            const isSafe = isTransientError(error, attempt, isIdempotent, isDatabaseOnlyTransaction);
             if (attempt > retries || !isSafe) {
                 throw error;
             }
@@ -788,22 +795,23 @@ export function cancellationMiddleware(req: Request, res: Response, next: NextFu
 ## 7. Advanced Enterprise Patterns for Scalability
 
 ### Pattern A: Two-Tier Idempotency Architecture
-Idempotency guarantees that retried network mutations execute side-effects exactly once. Backends must separate rapid transport caching from mission-critical financial mutations:
+Idempotency prevents duplicate business mutations within the defined idempotency boundary, while external event delivery and consumption require their own duplicate-handling guarantees (such as the Transactional Outbox pattern). Backends must separate rapid transport caching from mission-critical financial mutations:
 
 1. **Fast Cache Acceleration (Redis)**: Rapid deduplication on high-throughput mutation endpoints. Must enforce:
    - **Operation Scope**: `idempotency:<orgId>:<userId>:<method>:<routePath>:<idempotencyKey>` prevents cross-tenant or cross-endpoint key collisions.
    - **Full Fingerprint**: Recursive canonical SHA-256 hash across HTTP method, route, params, query, and payload.
-   - **Ownership & Heartbeat**: Acquire key with a random UUID `ownerToken`. While execution is in-flight, a heartbeat periodically extends the short pending lease (`pendingTtlSeconds = 60`) so operations taking >60s never lose their lock to a retry.
+   - **Ownership & Best-Effort Heartbeat**: Acquire key with a random UUID `ownerToken`. While execution is in-flight, a periodic heartbeat extends the short pending lease (`pendingTtlSeconds = 60`). If heartbeat renewal encounters repeated network failures, the lease is marked lost and fails closed (503). *Note: Redis heartbeats provide best-effort lease extension rather than a strict distributed fencing token.*
+   - **Comprehensive Response Interception**: Intercepts `res.json`, `res.send`, and `res.end` (supporting 204 No Content), with terminal lifecycle listeners (`finish`, `close`) guaranteeing heartbeat cleanup.
    - **Atomic Lua Completion & Cleanup**: Completion is committed via Lua only if `ownerToken` matches. Failed requests release their lease via compare-and-delete Lua only if `ownerToken` matches.
    - **Fail-Closed Persistence**: If completed state cannot be persisted to Redis, return 503 so clients do not proceed with untracked side-effects.
    - **Canonical Implementation**: See `examples/resilience/idempotency.ts` (`cacheIdempotencyMiddleware`).
 
 2. **Durable Financial Standard (PostgreSQL Interactive Transactions)**: Authoritative standard for ledger balance changes, payment charges, and order checkouts:
-   - **Transactional by Construction**: `executeWithDbIdempotency(prisma, options, operation)` accepts the root Prisma client and creates an interactive `$transaction` internally. The `operation(tx)` callback is guaranteed to receive the transactional client.
-   - **Atomic Expiration & Reclamation**: Expired keys (`expires_at <= NOW()`) are atomically reclaimed and reset to PENDING within the same query, eliminating reliance on delayed background cleanup crons.
+   - **Transactional by Construction**: `executeWithDbIdempotency(prisma, options, operation)` accepts the root Prisma client and creates an interactive `$transaction` internally. The generic `operation(tx)` callback retains full Prisma model delegates (e.g. `tx.order.create()`).
+   - **Atomic Database-Clock Expiration & Reclamation**: Checks `expires_at <= clock_timestamp()` inside PostgreSQL. If an existing record is expired, it is atomically reclaimed and reset to PENDING with the new fingerprint, eliminating reliance on external cleanup crons or server clock drift.
    - **Safe Replay**: Evaluates `typeof http_code === 'number'` to correctly replay 204 No Content, null, 0, or empty string responses.
    - **Allowlisted Response Headers**: Replays safe metadata (`location`, `content-type`, `x-request-id`) while strictly excluding sensitive headers (`set-cookie`).
-   - **Outbox Invariant**: Never execute non-transactional external side-effects (e.g. Stripe card charges) inside `operation(tx)`; use the Transactional Outbox pattern.
+   - **Outbox Invariant**: Never execute non-transactional external side-effects (e.g. Stripe card charges) directly inside `operation(tx)`; use the Transactional Outbox pattern.
 
 ```typescript
 // Usage in Controllers & Routes (Canonical implementation: examples/resilience/idempotency.ts)
@@ -1325,7 +1333,7 @@ if (updated.count === 0) {
 - **Do** support `Idempotency-Key` headers on state-modifying operations (payments, tickets, orders).
 - **Do** use the Transactional Outbox pattern when mutating database state that requires background events.
 - **Do** clean up temporary resources (files, buffers, locks) inside `finally` blocks.
-- **Do** retry transient errors (network timeouts, HTTP 429/502/503/504, DB deadlocks) using `withRetry` with AWS Full Jitter, ensuring non-idempotent operations do NOT retry mid-flight network drops.
+- **Do** retry transient errors (network timeouts, HTTP 429/502/503/504, DB deadlocks) using `withRetry` with AWS Full Jitter, ensuring non-idempotent operations do NOT retry mid-flight network drops or unverified rate limits.
 - **Do** honor `Retry-After` headers on rate limits before calculating backoff delays, applying jitter smoothing.
 - **Do** wrap flaky third-party integrations with a Circuit Breaker.
 - **Do** register graceful shutdown handlers (`SIGTERM`/`SIGINT`) to drain connections, flush logs, and set `process.exitCode = 0` rather than calling `process.exit(0)`.
@@ -1362,7 +1370,7 @@ if (updated.count === 0) {
 - **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
 - **Never** query another module's database tables directly in a modular architecture (use public module interfaces).
 - **Never** perform dual writes (e.g. updating Postgres then publishing directly to Kafka/Rabbit/BullMQ without an outbox).
-- **Never** retry non-idempotent mutations on mid-flight dropped responses (`ECONNRESET`, `ETIMEDOUT`, `502`, `504`) without verified idempotency protection.
+- **Never** retry non-idempotent mutations on uncertain responses (HTTP 429, 502, 503, 504, `ECONNRESET`, `ETIMEDOUT`) without verified idempotency protection.
 - **Never** retry without jitter or beyond the 10% retry budget.
 - **Never** use `SET LOCAL lock_timeout` in prepared statements (use `SELECT set_config('lock_timeout', ..., TRUE)`).
 - **Never** omit `organizationId` from Optimistic Concurrency Control (`version`) updates.

@@ -1,4 +1,5 @@
 import { pipeline, finished } from 'node:stream/promises';
+import { once } from 'node:events';
 import { StringDecoder } from 'node:string_decoder';
 import readline from 'node:readline';
 import fs from 'node:fs';
@@ -77,8 +78,8 @@ export async function streamLinesWithReadline(
       const transformed = await processLine(line);
       const canWrite = writeStream.write(transformed + '\n');
       if (!canWrite) {
-        // Enforce backpressure when kernel write buffer is full
-        await new Promise((resolve) => writeStream.once('drain', resolve));
+        // Enforce backpressure: waits for 'drain', rejecting automatically if writeStream emits 'error'
+        await once(writeStream, 'drain');
       }
     }
     writeStream.end();

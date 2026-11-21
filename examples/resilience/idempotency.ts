@@ -125,6 +125,14 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
         logger,
     } = options;
 
+    //? Configuration boundary validation
+    if (!Number.isInteger(pendingTtlSeconds) || pendingTtlSeconds < 5) {
+        throw new RangeError('[Idempotency] pendingTtlSeconds must be an integer >= 5 seconds.');
+    }
+    if (!Number.isInteger(completedTtlSeconds) || completedTtlSeconds < pendingTtlSeconds) {
+        throw new RangeError('[Idempotency] completedTtlSeconds must be an integer >= pendingTtlSeconds.');
+    }
+
     return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
         const rawKey = req.header('Idempotency-Key');
         if (!rawKey) {
@@ -209,10 +217,15 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             // Hook response methods to capture body and await completion persistence
             const originalJson = res.json.bind(res);
             const originalSend = res.send.bind(res);
+            const originalEnd = res.end.bind(res);
             let responseHandled = false;
 
-            //? Heartbeat lease renewal: extends lease every pendingTtlSeconds / 3 while operation is running,
-            //? preventing concurrent execution if an operation takes longer than the initial 60s lease.
+            //? Lease health tracker: tracks whether this request still securely holds the Redis lease
+            let leaseHealthValid = true;
+            let consecutiveHeartbeatFailures = 0;
+
+            //? Heartbeat lease renewal: extends lease every pendingTtlSeconds / 3 while operation is running.
+            //? If Redis fails or lease is overtaken, leaseHealthValid becomes false and triggers fail-closed behavior.
             const heartbeatIntervalMs = Math.max(1000, Math.floor((pendingTtlSeconds * 1000) / 3));
             let heartbeatTimer: NodeJS.Timeout | null = setInterval(async () => {
                 try {
@@ -223,12 +236,30 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                         ownerToken,
                         pendingTtlSeconds.toString()
                     );
-                    if (extended !== 1 && heartbeatTimer) {
-                        clearInterval(heartbeatTimer);
-                        heartbeatTimer = null;
+                    if (extended === 1) {
+                        consecutiveHeartbeatFailures = 0;
+                    } else {
+                        // Key expired or lease was overtaken by a concurrent retry!
+                        leaseHealthValid = false;
+                        stopHeartbeat();
+                        logger?.error('[Idempotency] Pending lease lost or overtaken by concurrent request.', {
+                            redisKey,
+                            ownerToken,
+                        });
                     }
                 } catch (heartbeatErr) {
-                    logger?.warn('[Idempotency] Failed to extend pending lease heartbeat:', heartbeatErr);
+                    consecutiveHeartbeatFailures++;
+                    if (consecutiveHeartbeatFailures >= 2) {
+                        leaseHealthValid = false;
+                        stopHeartbeat();
+                        logger?.error('[Idempotency] Repeated heartbeat extension failures; lease considered lost.', {
+                            redisKey,
+                            consecutiveHeartbeatFailures,
+                            heartbeatErr,
+                        });
+                    } else {
+                        logger?.warn('[Idempotency] Transient heartbeat failure renewing pending lease:', heartbeatErr);
+                    }
                 }
             }, heartbeatIntervalMs);
             heartbeatTimer.unref();
@@ -240,8 +271,19 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                 }
             };
 
+            // Guarantee cleanup on every terminal response path (including early abort / connection drop)
+            res.once('finish', () => stopHeartbeat());
+            res.once('close', () => stopHeartbeat());
+
             const persistCompletion = async (statusCode: number, body: unknown): Promise<boolean> => {
                 stopHeartbeat();
+
+                // If lease health was lost during execution, do not attempt completion persistence
+                if (!leaseHealthValid) {
+                    logger?.error('[Idempotency] Aborting completion persistence: lease health was lost during execution.');
+                    return false;
+                }
+
                 try {
                     if (statusCode >= 200 && statusCode < 300) {
                         const record: StoredIdempotencyRecord = {
@@ -273,11 +315,12 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
 
             const captureAndSend = (
                 body: unknown,
-                sender: (data: unknown) => Response,
-                isJson: boolean
+                sender: () => Response | void,
+                mode: 'json' | 'send' | 'end'
             ): Response => {
                 if (responseHandled) {
-                    return sender(body);
+                    sender();
+                    return res;
                 }
                 responseHandled = true;
 
@@ -285,22 +328,35 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                     //! Fail-closed: If completion cannot be persisted in Redis, report 503 using unpatched sender
                     if (!persisted && failClosed && res.statusCode >= 200 && res.statusCode < 300) {
                         res.status(503);
-                        if (isJson) {
+                        if (mode === 'json') {
                             return originalJson({
                                 error: true,
                                 message: 'Operation executed but idempotency confirmation failed. Contact support before retrying.',
                             });
                         }
-                        return originalSend('Operation executed but idempotency confirmation failed.');
+                        return originalSend('Operation executed but idempotency confirmation failed. Contact support before retrying.');
                     }
-                    sender(body);
+                    sender();
                 });
 
                 return res;
             };
 
-            res.json = (body: unknown): Response => captureAndSend(body, originalJson, true);
-            res.send = (body: unknown): Response => captureAndSend(body, originalSend, false);
+            res.json = (body: unknown): Response => captureAndSend(body, () => originalJson(body), 'json');
+            res.send = (body: unknown): Response => captureAndSend(body, () => originalSend(body), 'send');
+            res.end = (chunk?: unknown, encoding?: unknown, cb?: unknown): Response => {
+                let actualCb = cb;
+                let actualChunk = chunk;
+                if (typeof actualChunk === 'function') {
+                    actualCb = actualChunk;
+                    actualChunk = undefined;
+                }
+                return captureAndSend(
+                    actualChunk ?? null,
+                    () => (originalEnd as (chunk?: unknown, encoding?: unknown, cb?: unknown) => Response)(actualChunk, encoding, actualCb),
+                    'end'
+                );
+            };
 
             next();
         } catch (err) {
@@ -366,14 +422,14 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
  * ```
  */
 
-export interface PrismaTransactionClient {
+export interface DbRawTransactionClient {
     $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
     $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
 }
 
-export interface PrismaClientLike {
+export interface PrismaClientLike<TTx extends DbRawTransactionClient = DbRawTransactionClient> {
     $transaction<T>(
-        action: (tx: PrismaTransactionClient) => Promise<T>,
+        action: (tx: TTx) => Promise<T>,
         options?: { maxWait?: number; timeout?: number; isolationLevel?: string }
     ): Promise<T>;
 }
@@ -413,11 +469,13 @@ function filterReplayHeaders(headers?: Record<string, string>): Record<string, s
  * 
  * Production Safety Rules:
  * 1. Transactional Atomicity by Construction:
- *    Accepts `prisma: PrismaClientLike` and constructs the interactive `$transaction` internally.
- *    The `operation(tx)` callback MUST execute all entity mutations through the supplied `tx`.
- * 2. Atomic Expiration & Key Reclamation:
- *    If an existing idempotency record is expired (expires_at <= NOW()), it is atomically reclaimed
- *    and reset to PENDING with the new fingerprint, without relying on an external cleanup cron.
+ *    Accepts `prisma: PrismaClientLike<TTx>` and constructs the interactive `$transaction` internally.
+ *    The generic `TTx` preserves Prisma's generated model delegates (e.g. `tx.order.create()`) while
+ *    requiring `$queryRaw` and `$executeRaw` for idempotency management.
+ * 2. Atomic Expiration & Key Reclamation via Database Clock:
+ *    Expiration is strictly evaluated against PostgreSQL's `clock_timestamp()` inside SQL. If an existing
+ *    record is expired, it is atomically reclaimed and reset to PENDING with the new fingerprint,
+ *    eliminating reliance on external cleanup crons or vulnerable application-server clock synchronization.
  * 3. Unprotected Side Effects Prohibited:
  *    NEVER perform non-transactional external side effects (e.g. charging a payment card, publishing
  *    Kafka messages, external HTTP webhooks) directly inside `operation(tx)`. Use the Transactional
@@ -440,15 +498,15 @@ function filterReplayHeaders(headers?: Record<string, string>): Record<string, s
  * });
  * ```
  */
-export async function executeWithDbIdempotency<T>(
-    prisma: PrismaClientLike,
+export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransactionClient = DbRawTransactionClient>(
+    prisma: PrismaClientLike<TTx>,
     options: DbIdempotencyOptions,
-    operation: (tx: PrismaTransactionClient) => Promise<{
+    operation: (tx: TTx) => Promise<{
         httpCode: number;
-        body: T;
+        body: TResult;
         headers?: Record<string, string>;
     }>
-): Promise<IdempotentExecutionResult<T>> {
+): Promise<IdempotentExecutionResult<TResult>> {
     const {
         organizationId,
         scope,
@@ -481,10 +539,11 @@ export async function executeWithDbIdempotency<T>(
                 request_fingerprint: string;
                 http_code: number | null;
                 response_headers: Record<string, string> | null;
-                response_body: T | null;
-                expires_at: Date;
+                response_body: TResult | null;
+                is_expired: boolean;
             }>>`
-                SELECT status, request_fingerprint, http_code, response_headers, response_body, expires_at
+                SELECT status, request_fingerprint, http_code, response_headers, response_body,
+                       (expires_at <= clock_timestamp()) AS is_expired
                 FROM idempotency_records
                 WHERE organization_id = ${organizationId}
                   AND scope = ${scope}
@@ -497,9 +556,8 @@ export async function executeWithDbIdempotency<T>(
                 throw new Error('Concurrent idempotency race: record not found after conflict.');
             }
 
-            //? Expiration Enforcement: If previous record has expired, atomically reclaim and reset it to PENDING
-            const isExpired = new Date(existing.expires_at).getTime() <= Date.now();
-            if (isExpired) {
+            //? Expiration Enforcement: Evaluated via PostgreSQL clock_timestamp() to avoid server clock skew
+            if (existing.is_expired) {
                 await tx.$executeRaw`
                     UPDATE idempotency_records
                     SET status = 'PENDING',
@@ -525,7 +583,7 @@ export async function executeWithDbIdempotency<T>(
                         isReplay: true,
                         httpCode: existing.http_code,
                         headers: existing.response_headers ?? undefined,
-                        data: existing.response_body as T,
+                        data: existing.response_body as TResult,
                     };
                 }
 
