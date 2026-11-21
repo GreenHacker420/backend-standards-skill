@@ -71,6 +71,10 @@ When authoring backend code, adhere strictly to these core principles:
 30. **Semantic Commenting Taxonomy (`Better Comments` Style)**: Comments must document *why*, never *what*. Use semantic tags (`//?` Rationale, `//!` Hazards/Invariants, `//*` Business Rules, `//&` Boundaries). Never state the obvious.
 31. **Guard Clauses & Flat Code Hierarchy**: Eliminate deep nesting (arrow code) by validating pre-conditions early and returning immediately. Keep the happy path flat against the left margin.
 32. **The 65-Line Controller Rule & Zero Dead Code**: Controllers must remain under 65 lines of code, delegating workflows to orchestrators. Never commit commented-out zombie code; rely on Git history.
+33. **Timing-Safe Cryptographic Comparisons**: Never use `===` to verify HMAC webhook signatures or secret tokens. Always use `crypto.timingSafeEqual` over fixed-length Buffers to prevent timing side-channel attacks.
+34. **Backpressured Stream Pipelines (OOM Prevention)**: Never load large files, CSV imports, or media buffers entirely into memory with `fs.readFileSync`. Always use Node.js `stream.pipeline` with `Transform` streams.
+35. **Transaction-Bound PostgreSQL Advisory Locks**: Prefer `SELECT pg_advisory_xact_lock($1)` over fragile Redis mutexes for database operations; advisory locks automatically release on `COMMIT` or `ROLLBACK` even if the process crashes.
+36. **Cost-Weighted Abuse Prevention**: Enforce dynamic point costs on rate limiters so expensive operations (PDF generation, AI embeddings, large exports) consume 10x more quota than fast reads.
 
 ---
 
@@ -996,7 +1000,68 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 
 ---
 
-## 11. Agent Checklist & Anti-Patterns to Avoid
+## 11. Production-Safe Code & Security Patterns
+
+### A. Timing-Safe Cryptographic Comparison
+Never compare HMAC signatures or tokens with `===`. String comparison exits on the first mismatched byte, creating timing side-channel vulnerabilities:
+
+```typescript
+// See examples/safety/timing-safe.ts
+import crypto from 'crypto';
+
+export function verifySignature(received: string, expected: string): boolean {
+    const a = Buffer.from(received, 'utf8');
+    const b = Buffer.from(expected, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+```
+
+### B. Backpressured Stream Pipelines (OOM Prevention)
+Never load large CSVs, audio files, or PDF reports into memory via `fs.readFileSync` or accumulators (`records.push(row)`). An unbounded 50MB file expands in V8 memory and triggers `JavaScript heap out of memory`. Use `stream.pipeline` to enforce backpressure:
+
+```typescript
+// See examples/safety/streaming-pipeline.ts
+import { pipeline } from 'stream/promises';
+import { Transform } from 'stream';
+import fs from 'fs';
+
+await pipeline(
+    fs.createReadStream(filePath),
+    new Transform({
+        objectMode: true,
+        async transform(chunk, enc, cb) {
+            await processChunk(chunk);
+            cb(); // Upstream disk reader pauses until this callback fires!
+        }
+    }),
+    destinationStream
+);
+```
+
+### C. Transaction-Bound PostgreSQL Advisory Locks
+Unlike Redis distributed locks (which risk becoming orphaned if a container crashes before `redis.del()`), PostgreSQL advisory locks bind to the ACID transaction lifecycle. They **automatically release** on `COMMIT` or `ROLLBACK`:
+
+```typescript
+// See examples/safety/advisory-lock.ts
+await prisma.$transaction(async (tx) => {
+    // Locks this 64-bit ID for the duration of THIS transaction only
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${entityId})`;
+    await performSensitiveMutation(tx);
+});
+```
+
+### D. Cost-Weighted Abuse Prevention
+Generic rate limiters (e.g. 100 req/min) leave backends vulnerable to CPU exhaustion if an attacker spams expensive routes (PDF exports, vector embeddings). Charge higher points per route:
+
+```typescript
+// See examples/safety/cost-rate-limiter.ts
+router.post('/export/pdf', rateLimit({ maxPoints: 100, windowSeconds: 60 })((req) => 25), exportPdfAction);
+```
+
+---
+
+## 12. Agent Checklist & Anti-Patterns to Avoid
 
 ### ✅ DOs:
 - **Do** wrap every asynchronous controller in `try { ... } catch (error) { next(error); }`.
@@ -1032,6 +1097,10 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Do** use guard clauses with early returns to keep the happy path completely flat against the left margin.
 - **Do** keep HTTP controllers under 65 lines of code, delegating domain logic to orchestrators.
 - **Do** prefix boolean variables with active predicates (`isValid`, `hasPermission`, `canRetry`).
+- **Do** use `crypto.timingSafeEqual` for all webhook signature and token comparisons.
+- **Do** process large files and CSVs using `stream.pipeline` and `Transform` streams to prevent heap OOM crashes.
+- **Do** use PostgreSQL transaction-level advisory locks (`pg_advisory_xact_lock`) for distributed database mutexes.
+- **Do** assign dynamic point costs to rate limiters on CPU-heavy endpoints (PDF, AI, exports).
 
 ### ❌ DON'Ts:
 - **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
@@ -1040,6 +1109,9 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Never** retry without an Idempotency-Key on non-idempotent mutations.
 - **Never** retry without jitter or beyond the 10% retry budget.
 - **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
+- **Never** compare cryptographic signatures or tokens using standard `===` (vulnerable to timing attacks).
+- **Never** read entire large files into memory with `fs.readFileSync` or accumulate unbounded arrays.
+- **Never** rely on Redis distributed locks for operations that require ACID rollback guarantees.
 - **Never** write redundant comments that state the obvious (`// get user by id: await getUserById()`).
 - **Never** nest logic 3+ levels deep inside `if/else` ladders (arrow code anti-pattern).
 - **Never** commit commented-out zombie code (`// const oldLogic = ...`). Rely on Git history.

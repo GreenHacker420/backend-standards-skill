@@ -87,6 +87,10 @@ This repository codifies the architectural discipline to eliminate these problem
 15. **Type-Safe Prisma Projections (Zero `as any`)**: Enforce exact SQL projection contracts with `satisfies Prisma.Select` and `Prisma.GetPayload`.
 16. **Semantic Commenting Taxonomy (`Better Comments` Style)**: Color-coded visual tags (`//?` Rationale, `//!` Invariants/Hazards, `//*` Business Rules, `//&` Boundaries). Comments explain *why*, never *what*.
 17. **Guard Clauses & Flat Code Hierarchy**: Kill the arrow anti-pattern with early return guard clauses. Enforce the 65-line controller rule and zero commented-out zombie code.
+18. **Timing-Safe Cryptographic Comparisons**: Constant-time verification via `crypto.timingSafeEqual` preventing timing attacks on webhooks.
+19. **Backpressured Stream Pipelines (OOM Prevention)**: Stream large CSVs and files with `stream.pipeline` to prevent Node.js heap exhaustion.
+20. **Transaction-Bound PostgreSQL Advisory Locks**: `pg_advisory_xact_lock` distributed mutexes that auto-release on transaction commit/abort.
+21. **Cost-Weighted Abuse Prevention**: Multi-point token bucket rate limiting charging dynamic points per endpoint cost.
 
 ---
 
@@ -102,6 +106,7 @@ This repository codifies the architectural discipline to eliminate these problem
 │   ├── orchestrators/             # Domain orchestrators decoupled from HTTP transport
 │   ├── observability/             # AsyncLocalStorage request context, tracing, tail-sampler, logger
 │   ├── resilience/                # Retry budget, singleflight, degradation manager, circuit breaker
+│   ├── safety/                    # Timing-safe comparison, streaming pipeline, advisory locks, cost rate limiter
 │   ├── types/                     # Branded types, smart constructors, result pattern, prisma projections
 │   └── database/                  # Bulkheaded Prisma pools, transactional outbox relay
 ├── references/                    # Deep architectural design specifications
@@ -114,7 +119,8 @@ This repository codifies the architectural discipline to eliminate these problem
 │   ├── 07-failure-recovery-retry-budgets-dlq.md
 │   ├── 08-parse-dont-validate-and-domain-types.md
 │   ├── 09-result-pattern-and-prisma-types.md
-│   └── 10-commenting-clean-code-and-readability.md
+│   ├── 10-commenting-clean-code-and-readability.md
+│   └── 11-production-safety-code-patterns.md
 └── package.json
 ```
 
