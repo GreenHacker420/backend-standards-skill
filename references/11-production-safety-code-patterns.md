@@ -128,12 +128,12 @@ export async function withPostgresAdvisoryLock<T>(
   options: { timeoutMs?: number } = {}
 ): Promise<T> {
   const { timeoutMs = 5000 } = options;
-  const safeLockId = typeof lockId === 'number' ? BigInt(lockId) : lockId;
+  const safeLockId = typeof lockId === 'bigint' ? lockId : BigInt(lockId);
 
   return prisma.$transaction(async (tx) => {
-    //? 1. Prevent indefinite lock queue starvation
+    //? 1. Prevent indefinite lock queue starvation using set_config (prepared statement safe)
     if (timeoutMs > 0) {
-      await tx.$executeRaw`SET LOCAL lock_timeout = ${`${timeoutMs}ms`}`;
+      await tx.$queryRaw`SELECT set_config('lock_timeout', ${`${timeoutMs}ms`}, TRUE)`;
     }
 
     //? 2. Acquire 64-bit advisory lock using $queryRaw (never $executeRaw for SELECTs)
@@ -164,6 +164,14 @@ export interface RateLimiterOptions {
   costCalculator?: (req: Request) => number;
 }
 
+const ATOMIC_COST_LIMITER_LUA = `
+local current = redis.call('INCRBY', KEYS[1], ARGV[1])
+if current == tonumber(ARGV[1]) then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return current
+`;
+
 export class CostWeightedRateLimiter {
   constructor(private redis: Redis) {}
 
@@ -171,17 +179,21 @@ export class CostWeightedRateLimiter {
     const { windowSeconds, maxPoints, costCalculator = () => 1 } = options;
 
     return async (req: Request, res: Response, next: NextFunction) => {
-      const cost = Math.max(1, costCalculator(req));
+      const rawCost = costCalculator(req);
+      const cost = Number.isInteger(rawCost) && rawCost > 0 ? rawCost : 1;
       const orgId = req.currentOrganizationUser?.organizationId;
       const key = orgId
         ? `ratelimit:org:${orgId}`
         : `ratelimit:ip:${req.ip || 'unknown'}`;
 
-      // Atomic increment by cost with sliding expiration
-      const current = await this.redis.incrby(key, cost);
-      if (current === cost) {
-        await this.redis.expire(key, windowSeconds);
-      }
+      // Atomic execution: increments counter and binds TTL in a single Redis transaction
+      const current = (await this.redis.eval(
+        ATOMIC_COST_LIMITER_LUA,
+        1,
+        key,
+        cost,
+        windowSeconds
+      )) as number;
 
       res.setHeader('X-RateLimit-Limit', maxPoints);
       res.setHeader('X-RateLimit-Remaining', Math.max(0, maxPoints - current));

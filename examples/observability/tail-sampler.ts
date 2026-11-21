@@ -1,7 +1,13 @@
 /**
- * In-Memory Tail-Based Tracing Sampler
- * Buffers spans during request lifecycle and evaluates sampling policy on completion.
- * Retains 100% of errors and p99 latency spikes, while downsampling healthy fast requests.
+ * In-Memory Tail-Based Tracing Decision Helper (Heuristic Filter)
+ * 
+ * Production Architecture Notice:
+ * For multi-instance distributed tracing, the OpenTelemetry Collector with its
+ * `tail_sampling` processor is the industry standard.
+ * 
+ * This in-memory sampler demonstrates the decision heuristics for buffering in-flight spans
+ * and evaluating sampling decisions upon request completion (retaining 100% of errors
+ * and slow-request outliers, while downsampling healthy fast requests).
  */
 
 export interface Span {
@@ -18,15 +24,23 @@ export interface Span {
 
 export interface TailSamplingPolicy {
   errorSamplingRate: number;      // 1.0 = 100%
-  slowThresholdMs: number;        // e.g. 1000ms
+  slowThresholdMs: number;        // Fixed latency threshold (e.g. 1000ms)
   slowSamplingRate: number;       // 1.0 = 100%
   tier0SamplingRate: number;      // 1.0 = 100%
   baselineSamplingRate: number;   // 0.01 = 1%
+  maxActiveTraces?: number;       // Bounded memory protection (default: 5000)
+  maxSpansPerTrace?: number;      // Bounded trace size protection (default: 100)
+  traceTtlMs?: number;            // Eviction TTL for abandoned spans (default: 30000ms)
+}
+
+interface InFlightTraceEntry {
+  createdAt: number;
+  spans: Span[];
 }
 
 export class TailSampler {
-  private inFlightTraces = new Map<string, Span[]>();
-  private readonly policy: TailSamplingPolicy;
+  private inFlightTraces = new Map<string, InFlightTraceEntry>();
+  private readonly policy: Required<TailSamplingPolicy>;
 
   constructor(policy: Partial<TailSamplingPolicy> = {}) {
     this.policy = {
@@ -35,25 +49,56 @@ export class TailSampler {
       slowSamplingRate: 1.0,
       tier0SamplingRate: 1.0,
       baselineSamplingRate: 0.01,
+      maxActiveTraces: 5000,
+      maxSpansPerTrace: 100,
+      traceTtlMs: 30_000,
       ...policy,
     };
   }
 
+  //? Evicts abandoned traces to guarantee zero unbounded memory growth
+  private pruneExpiredTraces(): void {
+    const now = Date.now();
+    for (const [traceId, entry] of this.inFlightTraces.entries()) {
+      if (now - entry.createdAt > this.policy.traceTtlMs) {
+        this.inFlightTraces.delete(traceId);
+      }
+    }
+  }
+
   public recordSpan(span: Span): void {
-    const spans = this.inFlightTraces.get(span.traceId) ?? [];
-    spans.push(span);
-    this.inFlightTraces.set(span.traceId, spans);
+    // Periodic bounded eviction
+    if (this.inFlightTraces.size >= this.policy.maxActiveTraces) {
+      this.pruneExpiredTraces();
+      // If still saturated, drop span to prevent heap exhaustion
+      if (this.inFlightTraces.size >= this.policy.maxActiveTraces) {
+        return;
+      }
+    }
+
+    const entry = this.inFlightTraces.get(span.traceId) ?? {
+      createdAt: Date.now(),
+      spans: [],
+    };
+
+    if (entry.spans.length < this.policy.maxSpansPerTrace) {
+      entry.spans.push(span);
+    }
+
+    this.inFlightTraces.set(span.traceId, entry);
   }
 
   /**
-   * Called when root request terminates. Evaluates policies to decide whether to flush or drop.
+   * Called when root request terminates. Evaluates heuristic policies to decide whether to flush or drop.
    */
   public evaluateTrace(
     traceId: string,
     metadata: { statusCode: number; durationMs: number; tier?: number }
   ): { sampled: boolean; reason: string; spans: Span[] } {
-    const spans = this.inFlightTraces.get(traceId) ?? [];
+    const entry = this.inFlightTraces.get(traceId);
     this.inFlightTraces.delete(traceId);
+
+    const spans = entry?.spans ?? [];
 
     // Rule 1: Errors (5xx or explicit error)
     if (metadata.statusCode >= 500 || spans.some((s) => s.error)) {
@@ -62,10 +107,10 @@ export class TailSampler {
       }
     }
 
-    // Rule 2: Latency Outliers (p95 / p99 violations)
+    // Rule 2: Latency Outliers (slow-request threshold)
     if (metadata.durationMs >= this.policy.slowThresholdMs) {
       if (Math.random() < this.policy.slowSamplingRate) {
-        return { sampled: true, reason: 'latency_violation', spans };
+        return { sampled: true, reason: 'latency_threshold_exceeded', spans };
       }
     }
 

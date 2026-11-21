@@ -16,6 +16,7 @@ export interface QueueProcessManager {
 export interface LoggerClient {
   info(msg: string, ...meta: unknown[]): void;
   error(msg: string, ...meta: unknown[]): void;
+  flush?(): Promise<void>;
 }
 
 export interface ShutdownDependencies {
@@ -107,7 +108,15 @@ export class ShutdownManager {
 
         clearTimeout(forceExitTimer);
         logger.info('Graceful shutdown completed successfully.');
-        process.exit(0);
+
+        // Step 6: Flush logger transports & pending telemetry buffers
+        if (logger.flush) {
+          await logger.flush();
+        }
+
+        // Node.js Best Practice: set exitCode and allow event loop to drain naturally
+        // process.exit() terminates immediately, potentially dropping pending stdout/stderr writes
+        process.exitCode = 0;
       } catch (err) {
         logger.error('Error encountered during graceful shutdown:', err);
         process.exit(1);

@@ -80,9 +80,12 @@ When authoring backend code, adhere strictly to these core principles:
 
 ---
 
-## 2. Directory Layout Standard
+## 2. Directory Layout Reference Standards
 
-Organize all backend projects according to this folder structure:
+Select the architectural layout that aligns with your service's domain complexity, team boundaries, and coupling profile:
+
+### Reference Layout A: Layered Architecture (Domain-Grouped)
+Organize single-domain services or microservices according to this structure:
 
 ```
 src/
@@ -177,8 +180,8 @@ src/
 3. **Preserve Single-Action Controllers**: Inside `actions/`, each file exports a single endpoint handler. Never create bloated controller classes.
 
 ### Architecture Selection Policy: Layered vs Modular Vertical Slices
-- **Choose Layered Architecture** (`src/controllers/<domain>/`, `src/lib/<domain>/`) when building focused microservices, single-domain services, or applications with fewer than 20 endpoints where domain boundaries are already enforced at the repository/service boundary.
-- **Choose Modular Vertical Slices** (`src/modules/<feature>/`) when building medium-to-large modular monoliths, multi-domain SaaS backends, or applications with 20+ endpoints where grouping by business feature maximizes cohesion and minimizes cross-layer file hunting.
+- **Choose Reference Layout A (Layered Architecture)** when building focused microservices, applications with a single bounded context, low cross-domain friction, or where domain boundaries are already enforced at the independent deployment/service boundary.
+- **Choose Reference Layout B (Modular Vertical Slices)** when building multi-domain platforms or modular monoliths where distinct sub-domains (e.g., Orders, Inventory, Identity, Billing) evolve at different cadences, have separate feature ownership, or require strict public module interfaces (`index.ts`) to eliminate leaky database coupling. Do not rely on arbitrary endpoint counts; base the decision on domain boundaries, change frequency, and team cohesion.
 
 ---
 
@@ -595,24 +598,30 @@ export function extractRetryAfterMs(error: unknown): number | null {
 export function isTransientError(error: unknown, attempt: number, isIdempotent = false): boolean {
     if (!error || typeof error !== 'object') return false;
 
-    // HTTP 429, 502, 503, 504
-    if ('response' in error && error.response && typeof error.response === 'object') {
-        const status = (error.response as { status?: number }).status;
-        if (status === 429 || (status !== undefined && status >= 502 && status <= 504)) return true;
-        if (status === 500 && isIdempotent && attempt === 1) return true;
-        if (status !== undefined && status >= 400 && status < 500) return false;
-    }
-
-    // Node.js network connection drops, Undici socket timeouts & Prisma transient codes
+    // 1. Database rollbacks (Always safe to retry)
     if ('code' in error) {
         const code = (error as { code?: string }).code;
-        const transientCodes = new Set([
-            'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNABORTED', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE',
+        const dbRollbackCodes = new Set(['40P01', '40001', 'P2034', 'P1001', 'P1002', 'P1017', 'P2024']);
+        if (code && dbRollbackCodes.has(code)) return true;
+
+        // Connection refused before sending request
+        if (code === 'ECONNREFUSED' || code === 'ENOTFOUND') return true;
+
+        // Mid-flight drops (Hazard: mutation may have processed; ONLY retry if idempotent!)
+        const midFlightCodes = new Set([
+            'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN', 'EPIPE',
             'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
-            'P1001', 'P1002', 'P1017', 'P2024', 'P2034', // Prisma DB connection drops, pool timeouts & conflict
-            '40P01', '40001',                             // PostgreSQL Deadlocks and Serialization Failures
         ]);
-        if (code && transientCodes.has(code)) return true;
+        if (code && midFlightCodes.has(code)) return isIdempotent;
+    }
+
+    // 2. HTTP Status Codes
+    if ('response' in error && error.response && typeof error.response === 'object') {
+        const status = (error.response as { status?: number }).status;
+        if (status === 429 || status === 503) return true;
+        if (status === 502 || status === 504) return isIdempotent; // Origin may have executed; retry only if idempotent
+        if (status === 500 && isIdempotent && attempt === 1) return true;
+        if (status !== undefined && status >= 400 && status < 500) return false;
     }
 
     return false;
@@ -749,6 +758,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { getRedisConnection } from '@/utils/redisConnection';
 import { sendError } from '@/shared/standard-api-responses/send-error';
+import { logger } from '@/shared/logger';
 
 //? Zod boundary validation prevents header injection and ReDoS
 export const IdempotencyKeySchema = z
@@ -758,15 +768,32 @@ export const IdempotencyKeySchema = z
     .max(64, 'Idempotency key must be at most 64 characters')
     .regex(/^[a-zA-Z0-9_-]+$/, 'Idempotency key must contain only URL-safe alphanumeric characters');
 
-function computePayloadHash(payload: unknown): string {
-    if (!payload || (typeof payload === 'object' && Object.keys(payload).length === 0)) {
-        return 'empty';
+function canonicalize(obj: unknown): unknown {
+    if (obj === null || typeof obj !== 'object') return obj;
+    if (Array.isArray(obj)) return obj.map(canonicalize);
+    const sortedKeys = Object.keys(obj as Record<string, unknown>).sort();
+    const result: Record<string, unknown> = {};
+    for (const key of sortedKeys) {
+        const val = (obj as Record<string, unknown>)[key];
+        if (val !== undefined && typeof val !== 'function' && typeof val !== 'symbol') {
+            result[key] = canonicalize(val);
+        }
     }
-    const serialized = JSON.stringify(payload, Object.keys(payload as object).sort());
-    return crypto.createHash('sha256').update(serialized).digest('hex');
+    return result;
 }
 
-export function idempotencyMiddleware(options: { ttlSeconds?: number; failClosed?: boolean } = {}) {
+function computeRequestFingerprint(req: Request): string {
+    const payload = {
+        method: req.method.toUpperCase(),
+        route: req.baseUrl + (req.route?.path ?? req.path),
+        params: canonicalize(req.params),
+        query: canonicalize(req.query),
+        body: canonicalize(req.body),
+    };
+    return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+export function cacheIdempotencyMiddleware(options: { ttlSeconds?: number; failClosed?: boolean } = {}) {
     const { ttlSeconds = 86400, failClosed = true } = options;
 
     return async (req: Request, res: Response, next: NextFunction) => {
@@ -783,39 +810,43 @@ export function idempotencyMiddleware(options: { ttlSeconds?: number; failClosed
         // 2. Scope prevents cross-route or cross-tenant key collisions
         const orgId = req.currentOrganizationUser?.organizationId ?? 'public';
         const userId = req.currentOrganizationUser?.userId ?? 'anon';
-        const method = req.method.toUpperCase();
         const routePath = req.baseUrl + (req.route?.path ?? req.path);
-        const redisKey = `idempotency:${orgId}:${userId}:${method}:${routePath}:${idempotencyKey}`;
-        const currentFingerprint = computePayloadHash(req.body);
+        const redisKey = `idempotency:${orgId}:${userId}:${req.method.toUpperCase()}:${routePath}:${idempotencyKey}`;
+        const currentFingerprint = computeRequestFingerprint(req);
+        const ownerToken = crypto.randomUUID();
 
         const redis = getRedisConnection('cache');
 
         try {
-            // 2. Atomic lock acquisition with pending status
-            const initialRecord = { status: 'pending', fingerprint: currentFingerprint };
+            // 3. Atomic lock acquisition with pending status and lease ownership token
+            const initialRecord = { status: 'pending', ownerToken, fingerprint: currentFingerprint };
             const acquired = await redis.set(redisKey, JSON.stringify(initialRecord), 'EX', ttlSeconds, 'NX');
             
             if (!acquired) {
                 const existing = await redis.get(redisKey);
-                if (existing) {
-                    const parsed = JSON.parse(existing);
+                
+                //! Critical: If lock failed and record is missing, do NOT proceed to mutation (concurrency race)
+                if (!existing) {
+                    return sendError(res, 'Concurrent request in progress. Please retry.', 409);
+                }
 
-                    //! Conflict: Key reused with different payload parameters
-                    if (parsed.fingerprint !== currentFingerprint) {
-                        return sendError(res, 'Idempotency key reused with a different request payload.', 422);
-                    }
+                const parsed = JSON.parse(existing);
 
-                    if (parsed.status === 'completed' && parsed.httpCode) {
-                        res.setHeader('X-Cache-Lookup', 'HIT - Idempotent Replay');
-                        return res.status(parsed.httpCode).json(parsed.body);
-                    }
-                    if (parsed.status === 'pending') {
-                        return sendError(res, 'A request with this idempotency key is currently in flight.', 409);
-                    }
+                //! Conflict: Key reused with different payload/parameters
+                if (parsed.fingerprint !== currentFingerprint) {
+                    return sendError(res, 'Idempotency key reused with a different request payload or parameters.', 422);
+                }
+
+                if (parsed.status === 'completed' && parsed.httpCode) {
+                    res.setHeader('X-Cache-Lookup', 'HIT - Idempotent Replay');
+                    return res.status(parsed.httpCode).json(parsed.body);
+                }
+                if (parsed.status === 'pending') {
+                    return sendError(res, 'A request with this idempotency key is currently in flight.', 409);
                 }
             }
 
-            // 3. Intercept and AWAIT persistence before sending HTTP response
+            // 4. Intercept and AWAIT persistence before sending HTTP response
             const originalJson = res.json.bind(res);
             const originalSend = res.send.bind(res);
 
@@ -824,7 +855,7 @@ export function idempotencyMiddleware(options: { ttlSeconds?: number; failClosed
                     if (statusCode >= 200 && statusCode < 300) {
                         await redis.set(
                             redisKey,
-                            JSON.stringify({ status: 'completed', httpCode: statusCode, fingerprint: currentFingerprint, body }),
+                            JSON.stringify({ status: 'completed', ownerToken, httpCode: statusCode, fingerprint: currentFingerprint, body }),
                             'EX',
                             ttlSeconds,
                         );
@@ -941,7 +972,13 @@ class ShutdownManager {
                 logger.info('Redis connections closed.');
 
                 clearTimeout(forceExitTimer);
-                process.exit(0);
+                logger.info('Graceful shutdown completed successfully.');
+
+                // Step 6: Flush logger transports & pending telemetry buffers
+                if (logger.flush) await logger.flush();
+
+                // Set exitCode and allow event loop to drain naturally (zero abruptly dropped logs)
+                process.exitCode = 0;
             } catch (err) {
                 logger.error('Error during shutdown:', err);
                 process.exit(1);
@@ -1222,18 +1259,19 @@ Unlike Redis distributed locks (which risk becoming orphaned if a container cras
 ```typescript
 // See examples/safety/advisory-lock.ts
 await prisma.$transaction(async (tx) => {
-    // 1. Prevent indefinite lock queue starvation
-    await tx.$executeRaw`SET LOCAL lock_timeout = '5000ms'`;
+    // 1. Set transaction-local timeout via set_config (prepared statements reject dynamic SET LOCAL)
+    await tx.$queryRaw`SELECT set_config('lock_timeout', '5000ms', TRUE)`;
 
-    // 2. Locks this 64-bit ID for THIS transaction only (via $queryRaw)
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(${BigInt(entityId)})`;
+    // 2. Derive 64-bit BigInt (avoids 32-bit hashtext collisions and JS float precision loss)
+    const safeLockId = typeof entityId === 'bigint' ? entityId : BigInt(entityId);
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(${safeLockId})`;
 
     await performSensitiveMutation(tx);
 });
 ```
 
 ### D. Cost-Weighted Abuse Prevention
-Generic rate limiters (e.g. 100 req/min) leave backends vulnerable to CPU exhaustion if an attacker spams expensive routes (PDF exports, vector embeddings). Charge higher points per route:
+Generic rate limiters (e.g. 100 req/min) leave backends vulnerable to CPU exhaustion if an attacker spams expensive routes (PDF exports, vector embeddings). Charge higher points per route using atomic Lua scripts:
 
 ```typescript
 // See examples/safety/cost-rate-limiter.ts
@@ -1251,36 +1289,43 @@ router.post(
 ## 12. Multi-Tenancy & Transactional Concurrency Control
 
 ### Multi-Tenancy & Query Isolation (Preventing IDOR)
-Every query touching tenant-scoped tables must enforce tenant isolation at the infrastructure level. Use Prisma Client Extensions to automatically inject `organizationId` into every `where` clause:
+Every query touching tenant-scoped tables must enforce tenant isolation at the infrastructure level. Pair application-level scoping with PostgreSQL Row-Level Security (RLS) using PERMISSIVE policies and transaction-local `set_config`:
+
+```sql
+-- PostgreSQL RLS requires at least one PERMISSIVE policy to grant tenant access
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_policy ON orders
+  FOR ALL
+  TO app_user
+  USING (organization_id = NULLIF(current_setting('app.current_org_id', true), '')::integer)
+  WITH CHECK (organization_id = NULLIF(current_setting('app.current_org_id', true), '')::integer);
+```
 
 ```typescript
 // See references/12-multi-tenancy-and-transactional-concurrency.md
-export function createTenantPrismaClient(basePrisma: PrismaClient, organizationId: number) {
-    return basePrisma.$extends({
-        query: {
-            $allModels: {
-                async findMany({ args, query }) {
-                    args.where = { ...args.where, organizationId };
-                    return query(args);
-                },
-                async findFirst({ args, query }) {
-                    args.where = { ...args.where, organizationId };
-                    return query(args);
-                },
-            },
-        },
+export async function executeTenantTransaction<T>(
+    prisma: PrismaClient,
+    organizationId: number,
+    task: (tx: Prisma.TransactionClient) => Promise<T>
+): Promise<T> {
+    return prisma.$transaction(async (tx) => {
+        // Third argument (is_local = TRUE) binds setting strictly to this transaction, preventing pool leakage
+        await tx.$executeRaw`SELECT set_config('app.current_org_id', ${organizationId.toString()}, TRUE)`;
+        return await task(tx);
     });
 }
 ```
 
 ### Optimistic Concurrency Control (OCC)
-Prevent lost updates on inventory counts, wallet balances, and state machine transitions by maintaining a `version Int @default(0)` token:
+Prevent lost updates on inventory counts, wallet balances, and state machine transitions by maintaining a `version Int @default(0)` token, **always including `organizationId`** to maintain tenant isolation:
 
 ```typescript
 const updated = await prisma.order.updateMany({
     where: {
         id: orderId,
-        version: currentVersion, // Fails if another concurrent mutation incremented version
+        organizationId: currentTenantId, //! Mandatory: Never omit tenant boundary in OCC queries
+        version: currentVersion,          // Fails if another concurrent mutation incremented version
     },
     data: {
         status: 'PAID',
@@ -1289,7 +1334,7 @@ const updated = await prisma.order.updateMany({
 });
 
 if (updated.count === 0) {
-    throw new ConcurrencyConflictError('Order was concurrently modified. Please refresh and retry.');
+    throw new ConcurrencyConflictError('Order was concurrently modified or does not belong to tenant.');
 }
 ```
 
@@ -1306,17 +1351,17 @@ if (updated.count === 0) {
 - **Do** support `Idempotency-Key` headers on state-modifying operations (payments, tickets, orders).
 - **Do** use the Transactional Outbox pattern when mutating database state that requires background events.
 - **Do** clean up temporary resources (files, buffers, locks) inside `finally` blocks.
-- **Do** retry transient errors (network timeouts, HTTP 429/502/503/504, DB deadlocks) using `withRetry` with AWS Full Jitter.
-- **Do** honor `Retry-After` headers on rate limits before calculating backoff delays.
+- **Do** retry transient errors (network timeouts, HTTP 429/502/503/504, DB deadlocks) using `withRetry` with AWS Full Jitter, ensuring non-idempotent operations do NOT retry mid-flight network drops.
+- **Do** honor `Retry-After` headers on rate limits before calculating backoff delays, applying jitter smoothing.
 - **Do** wrap flaky third-party integrations with a Circuit Breaker.
-- **Do** register graceful shutdown handlers (`SIGTERM`/`SIGINT`) to drain connections before exit.
+- **Do** register graceful shutdown handlers (`SIGTERM`/`SIGINT`) to drain connections, flush logs, and set `process.exitCode = 0` rather than calling `process.exit(0)`.
 - **Do** create a single file for each controller endpoint (`src/controllers/<domain>/<action>.ts`).
 - **Do** declare validation schemas (Zod or Joi) right at the top of the controller file.
 - **Do** use semantic comment tags (`//?`, `//!`, `//&`, `//*`) to document rationale and constraints.
 - **Do** verify feature limits and permissions dynamically from database records (zero hardcoded rules).
 - **Do** use `sendResponse<T>`, `sendArrayResponse<T>`, and `sendError` for all HTTP responses.
 - **Do** organize bounded contexts into Modular Vertical Slices (`src/modules/<domain>/`) for high cohesion and easy maintenance.
-- **Do** implement Tail-Based Sampling to guarantee 100% trace retention for errors and p99 latency spikes.
+- **Do** implement Tail-Based Sampling to guarantee 100% trace retention for errors and slow-request latency outliers.
 - **Do** enforce a Token-Bucket Retry Budget (max 10% retries) to avoid retry storms during downstream degradation.
 - **Do** use Full Jitter for exponential backoff to avoid synchronized client retry waves.
 - **Do** quarantine poison pill payloads into a Dead Letter Queue (DLQ) with metadata.
@@ -1334,17 +1379,21 @@ if (updated.count === 0) {
 - **Do** prefix boolean variables with active predicates (`isValid`, `hasPermission`, `canRetry`).
 - **Do** use `crypto.timingSafeEqual` for all webhook signature and token comparisons.
 - **Do** process large files and CSVs using `stream.pipeline` and Async Generators to prevent heap OOM crashes.
-- **Do** use PostgreSQL transaction-level advisory locks (`pg_advisory_xact_lock`) for distributed database mutexes.
-- **Do** assign dynamic point costs to rate limiters on CPU-heavy endpoints (PDF, AI, exports).
-- **Do** scope all multi-tenant queries to `organizationId` at the ORM/RLS level to eliminate IDOR risks.
-- **Do** use Optimistic Concurrency Control (`version` token) to prevent lost updates on concurrent mutations.
+- **Do** use PostgreSQL transaction-level advisory locks (`pg_advisory_xact_lock`) with `set_config('lock_timeout', ..., TRUE)`.
+- **Do** assign dynamic point costs to rate limiters using atomic Lua scripts on CPU-heavy endpoints (PDF, AI, exports).
+- **Do** scope all multi-tenant queries to `organizationId` at the ORM and RLS level (using PERMISSIVE policies) to eliminate IDOR risks.
+- **Do** include `organizationId` in Optimistic Concurrency Control (`version`) updates to prevent cross-tenant mutations.
 
 ### ❌ DON'Ts:
 - **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
 - **Never** query another module's database tables directly in a modular architecture (use public module interfaces).
 - **Never** perform dual writes (e.g. updating Postgres then publishing directly to Kafka/Rabbit/BullMQ without an outbox).
-- **Never** retry without an Idempotency-Key on non-idempotent mutations.
+- **Never** retry non-idempotent mutations on mid-flight dropped responses (`ECONNRESET`, `ETIMEDOUT`, `502`, `504`) without verified idempotency protection.
 - **Never** retry without jitter or beyond the 10% retry budget.
+- **Never** use `SET LOCAL lock_timeout` in prepared statements (use `SELECT set_config('lock_timeout', ..., TRUE)`).
+- **Never** omit `organizationId` from Optimistic Concurrency Control (`version`) updates.
+- **Never** rely on restrictive-only RLS policies without a permissive base policy (blocks all tenant rows).
+- **Never** terminate graceful shutdown with raw `process.exit(0)` before flushing logger transports.
 - **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
 - **Never** compare cryptographic signatures or tokens using standard `===` (vulnerable to timing attacks).
 - **Never** read entire large files into memory with `fs.readFileSync` or accumulate unbounded arrays.
@@ -1353,6 +1402,18 @@ if (updated.count === 0) {
 - **Never** nest logic 3+ levels deep inside `if/else` ladders (arrow code anti-pattern).
 - **Never** commit commented-out zombie code (`// const oldLogic = ...`). Rely on Git history.
 - **Don't** let business workflows or persistence logic accumulate in controllers; review unusually long handlers and refactor when it improves clarity.
+- **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
+- **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
+- **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.
+- **Never** create "kitchen-sink" interfaces with dozens of optional fields (`paidAt?`, `refundedAt?`) when state is mutually exclusive.
+- **Never** leave floating promises un-awaited or without a `.catch()` handler.
+- **Never** swallow errors silently (`catch (e) {}`) without logging or proper handling.
+- **Never** retry permanent client errors (HTTP 400, 401, 403, 404, 422).
+- **Never** hardcode tenant quotas, feature flags, or permission rules in code. Query the DB.
+- **Never** use `(req as any)` to access user or session data. Update `src/typings/index.d.ts` instead.
+- **Never** return raw objects like `res.json({ foo: 'bar' })` or ad-hoc error formats.
+- **Never** perform business logic directly inside Express route files (`.routes.ts`).
+- **Never** read `process.env.*` directly throughout the codebase. Import from `@/env`.
 - **Never** use positional arguments with multiple primitives of the same type (`fn(id1, id2, str1, str2)`).
 - **Never** throw exceptions for ordinary expected domain states (e.g. `CouponExpired`, `InsufficientBalance`).
 - **Never** use type assertions (`as unknown as TargetType`) to bypass Prisma or TypeScript type checking.

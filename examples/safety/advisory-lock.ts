@@ -1,11 +1,14 @@
+import crypto from 'node:crypto';
+
 /**
  * PostgreSQL Transaction-Bound Advisory Lock Example
  * 
  * Advisory locks provide transactional mutexes tied directly to the ACID transaction lifetime.
  * They automatically release on COMMIT or ROLLBACK, even if the Node.js process crashes.
  * 
- * Note: Advisory locks protect operations within the scope of a single PostgreSQL database.
- * For coordination across distributed heterogeneous datastores, use Redis with proper TTLs
+ * Scope Notice:
+ * Advisory locks operate within the scope of a single PostgreSQL database.
+ * For distributed coordination across disparate systems or datastores, use Redis with safe TTLs
  * and singleflight/circuit breakers.
  */
 
@@ -22,9 +25,28 @@ export interface AdvisoryLockOptions {
   timeoutMs?: number; // Optional lock_timeout to prevent indefinite waiting
 }
 
+//? Safe lock ID conversion: rejects unsafe JavaScript floats/doubles that already lost precision
+export function toSafeLockId(lockId: number | bigint): bigint {
+  if (typeof lockId === 'bigint') {
+    return lockId;
+  }
+  if (!Number.isSafeInteger(lockId)) {
+    throw new TypeError(
+      `Lock ID number ${lockId} exceeds Number.MAX_SAFE_INTEGER. Pass a BigInt directly to prevent precision loss.`
+    );
+  }
+  return BigInt(lockId);
+}
+
+//? Derives a 64-bit integer from a string using SHA-256 (eliminates 32-bit hashtext collision risks)
+export function hashStringToLockId(key: string): bigint {
+  const hash = crypto.createHash('sha256').update(key).digest();
+  return hash.readBigInt64BE(0);
+}
+
 /**
  * Executes a critical section guarded by a 64-bit transaction-level advisory lock.
- * Uses Prisma $queryRaw for SELECT pg_advisory_xact_lock() and supports 64-bit BigInt.
+ * Uses PostgreSQL's set_config('lock_timeout', ..., TRUE) for valid dynamic parameterization.
  */
 export async function executeWithAdvisoryLock<T>(
   prisma: PrismaWithTransaction,
@@ -33,12 +55,13 @@ export async function executeWithAdvisoryLock<T>(
   options: AdvisoryLockOptions = {}
 ): Promise<T> {
   const { timeoutMs = 5000 } = options;
-  const safeLockId = typeof lockId === 'number' ? BigInt(lockId) : lockId;
+  const safeLockId = toSafeLockId(lockId);
 
   return prisma.$transaction(async (tx) => {
-    // Prevent indefinite blocking if another transaction holds the lock
+    //? PostgreSQL prepared statement rule: Dynamic lock_timeout cannot be set via 'SET LOCAL' prepared statements.
+    //? set_config(..., TRUE) correctly sets transaction-local parameterization.
     if (timeoutMs > 0) {
-      await tx.$executeRaw`SET LOCAL lock_timeout = ${`${timeoutMs}ms`}`;
+      await tx.$queryRaw`SELECT set_config('lock_timeout', ${`${timeoutMs}ms`}, TRUE)`;
     }
 
     // Acquire exclusive transaction-level advisory lock via $queryRaw
@@ -49,8 +72,8 @@ export async function executeWithAdvisoryLock<T>(
 }
 
 /**
- * String-based advisory lock using PostgreSQL's hashtext() function.
- * Allows locking on semantic keys like `tenant:123:order:456`.
+ * String-based advisory lock using 64-bit SHA-256 hash digest.
+ * Allows safe locking on semantic keys like `tenant:123:order:456` across the entire 64-bit namespace.
  */
 export async function executeWithStringAdvisoryLock<T>(
   prisma: PrismaWithTransaction,
@@ -58,16 +81,6 @@ export async function executeWithStringAdvisoryLock<T>(
   task: (tx: TransactionClient) => Promise<T>,
   options: AdvisoryLockOptions = {}
 ): Promise<T> {
-  const { timeoutMs = 5000 } = options;
-
-  return prisma.$transaction(async (tx) => {
-    if (timeoutMs > 0) {
-      await tx.$executeRaw`SET LOCAL lock_timeout = ${`${timeoutMs}ms`}`;
-    }
-
-    // hashtext generates a deterministic 32-bit integer from any string
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-
-    return await task(tx);
-  });
+  const safeLockId = hashStringToLockId(lockKey);
+  return executeWithAdvisoryLock(prisma, safeLockId, task, options);
 }
