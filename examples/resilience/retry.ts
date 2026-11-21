@@ -213,9 +213,12 @@ export async function withRetry<T>(
                     });
                     throw error;
                 }
-                delay = jitter
-                    ? retryAfterMs + Math.random() * Math.min(1000, retryAfterMs * 0.1)
-                    : retryAfterMs;
+                //? Bound jitter so it never causes total delay to exceed maxDelayMs
+                const maxAllowedJitter = Math.max(0, maxDelayMs - retryAfterMs);
+                const jitterDelta = jitter
+                    ? Math.random() * Math.min(1000, maxAllowedJitter, retryAfterMs * 0.1)
+                    : 0;
+                delay = retryAfterMs + jitterDelta;
             }
 
             // 6. Notify observers or emit structured telemetry log

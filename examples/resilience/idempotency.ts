@@ -67,6 +67,20 @@ export function computeRequestFingerprint(req: Request): string {
     return crypto.createHash('sha256').update(JSON.stringify(operationPayload)).digest('hex');
 }
 
+//? Atomic Lua script to extend pending lease only if owner token matches and status is pending
+const EXTEND_LEASE_LUA = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return 0
+end
+local cjson_ok, record = pcall(cjson.decode, raw)
+if cjson_ok and record and record.ownerToken == ARGV[1] and record.status == 'pending' then
+    return redis.call('EXPIRE', KEYS[1], ARGV[2])
+else
+    return -1
+end
+`;
+
 //? Atomic Lua script to complete idempotency record only if owner token matches
 const COMPLETE_IDEMPOTENCY_LUA = `
 local raw = redis.call('GET', KEYS[1])
@@ -136,6 +150,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
         const redisKey = `idempotency:${orgId}:${userId}:${req.method.toUpperCase()}:${routePath}:${idempotencyKey}`;
         const currentFingerprint = computeRequestFingerprint(req);
         const ownerToken = crypto.randomUUID();
+        let stopHeartbeat = () => {};
 
         try {
             const initialRecord: StoredIdempotencyRecord = {
@@ -196,7 +211,37 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
             const originalSend = res.send.bind(res);
             let responseHandled = false;
 
+            //? Heartbeat lease renewal: extends lease every pendingTtlSeconds / 3 while operation is running,
+            //? preventing concurrent execution if an operation takes longer than the initial 60s lease.
+            const heartbeatIntervalMs = Math.max(1000, Math.floor((pendingTtlSeconds * 1000) / 3));
+            let heartbeatTimer: NodeJS.Timeout | null = setInterval(async () => {
+                try {
+                    const extended = await redis.eval(
+                        EXTEND_LEASE_LUA,
+                        1,
+                        redisKey,
+                        ownerToken,
+                        pendingTtlSeconds.toString()
+                    );
+                    if (extended !== 1 && heartbeatTimer) {
+                        clearInterval(heartbeatTimer);
+                        heartbeatTimer = null;
+                    }
+                } catch (heartbeatErr) {
+                    logger?.warn('[Idempotency] Failed to extend pending lease heartbeat:', heartbeatErr);
+                }
+            }, heartbeatIntervalMs);
+            heartbeatTimer.unref();
+
+            stopHeartbeat = () => {
+                if (heartbeatTimer) {
+                    clearInterval(heartbeatTimer);
+                    heartbeatTimer = null;
+                }
+            };
+
             const persistCompletion = async (statusCode: number, body: unknown): Promise<boolean> => {
+                stopHeartbeat();
                 try {
                     if (statusCode >= 200 && statusCode < 300) {
                         const record: StoredIdempotencyRecord = {
@@ -259,6 +304,7 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
 
             next();
         } catch (err) {
+            stopHeartbeat();
             if (failClosed) {
                 res.status(503).json({
                     error: true,
@@ -295,9 +341,41 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
  * ```
  */
 
-export interface DbTransactionClient {
+/**
+ * ============================================================================
+ * Pattern B: Authoritative Durable PostgreSQL Idempotency (Financial Standard)
+ * ============================================================================
+ * 
+ * PostgreSQL DDL:
+ * ```sql
+ * CREATE TABLE idempotency_records (
+ *     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+ *     organization_id INTEGER NOT NULL,
+ *     scope VARCHAR(128) NOT NULL,
+ *     idempotency_key VARCHAR(64) NOT NULL,
+ *     request_fingerprint CHAR(64) NOT NULL,
+ *     status VARCHAR(16) NOT NULL CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED')),
+ *     http_code INTEGER,
+ *     response_headers JSONB,
+ *     response_body JSONB,
+ *     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ *     expires_at TIMESTAMPTZ NOT NULL,
+ *     CONSTRAINT uq_idempotency_scope_key UNIQUE (organization_id, scope, idempotency_key)
+ * );
+ * CREATE INDEX idx_idempotency_cleanup ON idempotency_records (expires_at) WHERE status = 'COMPLETED';
+ * ```
+ */
+
+export interface PrismaTransactionClient {
     $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
     $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+}
+
+export interface PrismaClientLike {
+    $transaction<T>(
+        action: (tx: PrismaTransactionClient) => Promise<T>,
+        options?: { maxWait?: number; timeout?: number; isolationLevel?: string }
+    ): Promise<T>;
 }
 
 export interface DbIdempotencyOptions {
@@ -306,12 +384,27 @@ export interface DbIdempotencyOptions {
     idempotencyKey: string;
     requestFingerprint: string;
     ttlMinutes?: number;
+    transactionTimeoutMs?: number;
 }
 
 export interface IdempotentExecutionResult<T> {
     isReplay: boolean;
     httpCode: number;
+    headers?: Record<string, string>;
     data: T;
+}
+
+//? Safe response header allowlist for replay (prevents replaying sensitive Set-Cookie headers)
+const ALLOWED_REPLAY_HEADERS = new Set(['location', 'content-type', 'x-request-id', 'content-language']);
+function filterReplayHeaders(headers?: Record<string, string>): Record<string, string> | null {
+    if (!headers) return null;
+    const filtered: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+        if (ALLOWED_REPLAY_HEADERS.has(k.toLowerCase())) {
+            filtered[k.toLowerCase()] = v;
+        }
+    }
+    return Object.keys(filtered).length > 0 ? filtered : null;
 }
 
 /**
@@ -320,97 +413,153 @@ export interface IdempotentExecutionResult<T> {
  * 
  * Production Safety Rules:
  * 1. Transactional Atomicity by Construction:
- *    The `operation` callback MUST accept `tx` and execute all entity mutations through this
- *    supplied transaction client, guaranteeing atomicity between business state and the idempotency record.
- * 2. Unprotected Side Effects Prohibited:
+ *    Accepts `prisma: PrismaClientLike` and constructs the interactive `$transaction` internally.
+ *    The `operation(tx)` callback MUST execute all entity mutations through the supplied `tx`.
+ * 2. Atomic Expiration & Key Reclamation:
+ *    If an existing idempotency record is expired (expires_at <= NOW()), it is atomically reclaimed
+ *    and reset to PENDING with the new fingerprint, without relying on an external cleanup cron.
+ * 3. Unprotected Side Effects Prohibited:
  *    NEVER perform non-transactional external side effects (e.g. charging a payment card, publishing
  *    Kafka messages, external HTTP webhooks) directly inside `operation(tx)`. Use the Transactional
  *    Outbox Pattern so side effects only dispatch after this database transaction commits.
- * 3. Failure Rollback Semantics:
+ * 4. Failure Rollback Semantics:
  *    When `operation(tx)` throws an error, PostgreSQL aborts the entire interactive transaction.
  *    Both partial business mutations and the PENDING idempotency record are cleanly rolled back,
  *    freeing the key for safe subsequent retries without orphaned locks.
+ * 
+ * Example Usage:
+ * ```typescript
+ * const result = await executeWithDbIdempotency(prisma, {
+ *     organizationId: req.tenantId,
+ *     scope: 'orders.checkout',
+ *     idempotencyKey: req.headers['idempotency-key'],
+ *     requestFingerprint: computeRequestFingerprint(req),
+ * }, async (tx) => {
+ *     const order = await tx.order.create({ data: orderInput });
+ *     return { httpCode: 201, body: order, headers: { location: `/orders/${order.id}` } };
+ * });
+ * ```
  */
 export async function executeWithDbIdempotency<T>(
-    tx: DbTransactionClient,
+    prisma: PrismaClientLike,
     options: DbIdempotencyOptions,
-    operation: (tx: DbTransactionClient) => Promise<{ httpCode: number; body: T }>
+    operation: (tx: PrismaTransactionClient) => Promise<{
+        httpCode: number;
+        body: T;
+        headers?: Record<string, string>;
+    }>
 ): Promise<IdempotentExecutionResult<T>> {
-    const { organizationId, scope, idempotencyKey, requestFingerprint, ttlMinutes = 1440 } = options;
+    const {
+        organizationId,
+        scope,
+        idempotencyKey,
+        requestFingerprint,
+        ttlMinutes = 1440,
+        transactionTimeoutMs = 10000,
+    } = options;
 
-    // 1. Attempt atomic insertion of PENDING record with ON CONFLICT DO NOTHING
-    const insertCount = await tx.$executeRaw`
-        INSERT INTO idempotency_records (
-            organization_id, scope, idempotency_key, request_fingerprint, status, expires_at
-        ) VALUES (
-            ${organizationId},
-            ${scope},
-            ${idempotencyKey},
-            ${requestFingerprint},
-            'PENDING',
-            NOW() + (${`${ttlMinutes} minutes`})::INTERVAL
-        )
-        ON CONFLICT (organization_id, scope, idempotency_key) DO NOTHING;
-    `;
-
-    // 2. If record already existed (insertCount === 0), evaluate existing record
-    if (insertCount === 0) {
-        const rows = await tx.$queryRaw<Array<{
-            status: 'PENDING' | 'COMPLETED' | 'FAILED';
-            request_fingerprint: string;
-            http_code: number | null;
-            response_body: T | null;
-            expires_at: Date;
-        }>>`
-            SELECT status, request_fingerprint, http_code, response_body, expires_at
-            FROM idempotency_records
-            WHERE organization_id = ${organizationId}
-              AND scope = ${scope}
-              AND idempotency_key = ${idempotencyKey}
-            FOR UPDATE;
+    return prisma.$transaction(async (tx) => {
+        // 1. Attempt atomic insertion of PENDING record with ON CONFLICT DO NOTHING
+        const insertCount = await tx.$executeRaw`
+            INSERT INTO idempotency_records (
+                organization_id, scope, idempotency_key, request_fingerprint, status, expires_at
+            ) VALUES (
+                ${organizationId},
+                ${scope},
+                ${idempotencyKey},
+                ${requestFingerprint},
+                'PENDING',
+                NOW() + (${`${ttlMinutes} minutes`})::INTERVAL
+            )
+            ON CONFLICT (organization_id, scope, idempotency_key) DO NOTHING;
         `;
 
-        const existing = rows[0];
-        if (!existing) {
-            throw new Error('Concurrent idempotency race: record not found after conflict.');
+        // 2. If record already existed (insertCount === 0), evaluate existing record
+        if (insertCount === 0) {
+            const rows = await tx.$queryRaw<Array<{
+                status: 'PENDING' | 'COMPLETED' | 'FAILED';
+                request_fingerprint: string;
+                http_code: number | null;
+                response_headers: Record<string, string> | null;
+                response_body: T | null;
+                expires_at: Date;
+            }>>`
+                SELECT status, request_fingerprint, http_code, response_headers, response_body, expires_at
+                FROM idempotency_records
+                WHERE organization_id = ${organizationId}
+                  AND scope = ${scope}
+                  AND idempotency_key = ${idempotencyKey}
+                FOR UPDATE;
+            `;
+
+            const existing = rows[0];
+            if (!existing) {
+                throw new Error('Concurrent idempotency race: record not found after conflict.');
+            }
+
+            //? Expiration Enforcement: If previous record has expired, atomically reclaim and reset it to PENDING
+            const isExpired = new Date(existing.expires_at).getTime() <= Date.now();
+            if (isExpired) {
+                await tx.$executeRaw`
+                    UPDATE idempotency_records
+                    SET status = 'PENDING',
+                        request_fingerprint = ${requestFingerprint},
+                        http_code = NULL,
+                        response_headers = NULL,
+                        response_body = NULL,
+                        expires_at = NOW() + (${`${ttlMinutes} minutes`})::INTERVAL,
+                        created_at = NOW()
+                    WHERE organization_id = ${organizationId}
+                      AND scope = ${scope}
+                      AND idempotency_key = ${idempotencyKey};
+                `;
+            } else {
+                //! Invariant check: Fingerprint mismatch indicates key reuse with different input
+                if (existing.request_fingerprint !== requestFingerprint) {
+                    throw new Error('Idempotency conflict: key was previously used with a different request payload.');
+                }
+
+                //? Safely replays valid responses with 204 No Content, null, false, 0, or empty string bodies
+                if (existing.status === 'COMPLETED' && typeof existing.http_code === 'number') {
+                    return {
+                        isReplay: true,
+                        httpCode: existing.http_code,
+                        headers: existing.response_headers ?? undefined,
+                        data: existing.response_body as T,
+                    };
+                }
+
+                if (existing.status === 'PENDING') {
+                    throw new Error('Mutation with this idempotency key is currently in progress.');
+                }
+            }
         }
 
-        //! Invariant check: Fingerprint mismatch indicates key reuse with different input
-        if (existing.request_fingerprint !== requestFingerprint) {
-            throw new Error('Idempotency conflict: key was previously used with a different request payload.');
-        }
+        // 3. Execute the core business operation passing tx to guarantee transactional binding
+        const result = await operation(tx);
 
-        //? Fix: Safely replays valid responses with 204 No Content, null, false, 0, or empty string bodies
-        if (existing.status === 'COMPLETED' && typeof existing.http_code === 'number') {
-            return {
-                isReplay: true,
-                httpCode: existing.http_code,
-                data: existing.response_body as T,
-            };
-        }
+        // 4. Safely serialize body (handling undefined -> null for 204 responses) and allowlisted headers
+        const serializedBody = result.body === undefined ? null : JSON.stringify(result.body);
+        const filteredHeaders = filterReplayHeaders(result.headers);
+        const serializedHeaders = filteredHeaders ? JSON.stringify(filteredHeaders) : null;
 
-        if (existing.status === 'PENDING') {
-            throw new Error('Mutation with this idempotency key is currently in progress.');
-        }
-    }
+        // 5. Atomically persist COMPLETED state and response body within the same ACID transaction
+        await tx.$executeRaw`
+            UPDATE idempotency_records
+            SET status = 'COMPLETED',
+                http_code = ${result.httpCode},
+                response_headers = ${serializedHeaders}::jsonb,
+                response_body = ${serializedBody}::jsonb
+            WHERE organization_id = ${organizationId}
+              AND scope = ${scope}
+              AND idempotency_key = ${idempotencyKey};
+        `;
 
-    // 3. Execute the core business operation passing tx to guarantee transactional binding
-    const result = await operation(tx);
-
-    // 4. Atomically persist COMPLETED state and response body within the same ACID transaction
-    await tx.$executeRaw`
-        UPDATE idempotency_records
-        SET status = 'COMPLETED',
-            http_code = ${result.httpCode},
-            response_body = ${JSON.stringify(result.body)}::jsonb
-        WHERE organization_id = ${organizationId}
-          AND scope = ${scope}
-          AND idempotency_key = ${idempotencyKey};
-    `;
-
-    return {
-        isReplay: false,
-        httpCode: result.httpCode,
-        data: result.body,
-    };
+        return {
+            isReplay: false,
+            httpCode: result.httpCode,
+            headers: filteredHeaders ?? undefined,
+            data: result.body,
+        };
+    }, { timeout: transactionTimeoutMs });
 }

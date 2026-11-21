@@ -179,3 +179,13 @@ await prisma.$transaction(
   }
 );
 ```
+
+---
+
+### 4. Durable Financial Idempotency (ACID Boundary Standard)
+For ledger mutations, payment provider confirmations, and order checkouts, idempotency MUST bind directly to the PostgreSQL ACID transaction rather than an external cache:
+
+- **Transactional by Construction**: The helper accepts `prisma: PrismaClient` and creates the interactive transaction internally via `prisma.$transaction(async (tx) => ...)`. This guarantees callers cannot accidentally execute business mutations on the global client.
+- **Atomic Lease Reclamation**: When conflict occurs on `(organization_id, scope, idempotency_key)`, if the existing record is expired (`expires_at <= NOW()`), it is atomically reclaimed and reset to `PENDING` within the same transaction, avoiding reliance on external cleanup crons.
+- **Header & Body Normalization**: Replays allowlisted response headers (`location`, `content-type`, `x-request-id`) while excluding sensitive headers (`set-cookie`). Normalizes `undefined` response bodies to SQL `NULL` so 204 No Content responses replay cleanly without re-executing.
+- **Full Implementation**: See [examples/resilience/idempotency.ts](file:///Users/harsh/Desktop/gitRepos/backend-standards-skill/examples/resilience/idempotency.ts#L295-L450).

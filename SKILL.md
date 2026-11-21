@@ -697,7 +697,9 @@ export async function withRetry<T>(
                     });
                     throw error;
                 }
-                delay = jitter ? retryAfterMs + Math.random() * Math.min(1000, retryAfterMs * 0.1) : retryAfterMs;
+                const maxAllowedJitter = Math.max(0, maxDelayMs - retryAfterMs);
+                const jitterDelta = jitter ? Math.random() * Math.min(1000, maxAllowedJitter, retryAfterMs * 0.1) : 0;
+                delay = retryAfterMs + jitterDelta;
             }
 
             if (onRetry) {
@@ -785,166 +787,58 @@ export function cancellationMiddleware(req: Request, res: Response, next: NextFu
 
 ## 7. Advanced Enterprise Patterns for Scalability
 
-### Pattern A: Idempotency Key Middleware
+### Pattern A: Two-Tier Idempotency Architecture
+Idempotency guarantees that retried network mutations execute side-effects exactly once. Backends must separate rapid transport caching from mission-critical financial mutations:
+
+1. **Fast Cache Acceleration (Redis)**: Rapid deduplication on high-throughput mutation endpoints. Must enforce:
+   - **Operation Scope**: `idempotency:<orgId>:<userId>:<method>:<routePath>:<idempotencyKey>` prevents cross-tenant or cross-endpoint key collisions.
+   - **Full Fingerprint**: Recursive canonical SHA-256 hash across HTTP method, route, params, query, and payload.
+   - **Ownership & Heartbeat**: Acquire key with a random UUID `ownerToken`. While execution is in-flight, a heartbeat periodically extends the short pending lease (`pendingTtlSeconds = 60`) so operations taking >60s never lose their lock to a retry.
+   - **Atomic Lua Completion & Cleanup**: Completion is committed via Lua only if `ownerToken` matches. Failed requests release their lease via compare-and-delete Lua only if `ownerToken` matches.
+   - **Fail-Closed Persistence**: If completed state cannot be persisted to Redis, return 503 so clients do not proceed with untracked side-effects.
+   - **Canonical Implementation**: See `examples/resilience/idempotency.ts` (`cacheIdempotencyMiddleware`).
+
+2. **Durable Financial Standard (PostgreSQL Interactive Transactions)**: Authoritative standard for ledger balance changes, payment charges, and order checkouts:
+   - **Transactional by Construction**: `executeWithDbIdempotency(prisma, options, operation)` accepts the root Prisma client and creates an interactive `$transaction` internally. The `operation(tx)` callback is guaranteed to receive the transactional client.
+   - **Atomic Expiration & Reclamation**: Expired keys (`expires_at <= NOW()`) are atomically reclaimed and reset to PENDING within the same query, eliminating reliance on delayed background cleanup crons.
+   - **Safe Replay**: Evaluates `typeof http_code === 'number'` to correctly replay 204 No Content, null, 0, or empty string responses.
+   - **Allowlisted Response Headers**: Replays safe metadata (`location`, `content-type`, `x-request-id`) while strictly excluding sensitive headers (`set-cookie`).
+   - **Outbox Invariant**: Never execute non-transactional external side-effects (e.g. Stripe card charges) inside `operation(tx)`; use the Transactional Outbox pattern.
+
 ```typescript
-// src/middlewares/idempotency.ts
-import { Request, Response, NextFunction } from 'express';
-import crypto from 'node:crypto';
-import { z } from 'zod';
-import { getRedisConnection } from '@/utils/redisConnection';
-import { sendError } from '@/shared/standard-api-responses/send-error';
-import { logger } from '@/shared/logger';
+// Usage in Controllers & Routes (Canonical implementation: examples/resilience/idempotency.ts)
+import { cacheIdempotencyMiddleware, executeWithDbIdempotency } from '@/shared/resilience/idempotency';
 
-//? Zod boundary validation prevents header injection and ReDoS
-export const IdempotencyKeySchema = z
-    .string()
-    .trim()
-    .min(16, 'Idempotency key must be at least 16 characters')
-    .max(64, 'Idempotency key must be at most 64 characters')
-    .regex(/^[a-zA-Z0-9_-]+$/, 'Idempotency key must contain only URL-safe alphanumeric characters');
+// 1. Redis Cache Middleware (for fast deduplication on API gateway routes)
+router.post(
+    '/orders/instant',
+    cacheIdempotencyMiddleware(redisClient, { pendingTtlSeconds: 60, completedTtlSeconds: 86400 }),
+    createInstantOrderAction
+);
 
-function canonicalize(obj: unknown): unknown {
-    if (obj === null || typeof obj !== 'object') return obj;
-    if (Array.isArray(obj)) return obj.map(canonicalize);
-    const sortedKeys = Object.keys(obj as Record<string, unknown>).sort();
-    const result: Record<string, unknown> = {};
-    for (const key of sortedKeys) {
-        const val = (obj as Record<string, unknown>)[key];
-        if (val !== undefined && typeof val !== 'function' && typeof val !== 'symbol') {
-            result[key] = canonicalize(val);
-        }
+// 2. Authoritative PostgreSQL Durable Idempotency (for financial mutations)
+export async function checkoutOrderAction(req: Request, res: Response) {
+    const result = await executeWithDbIdempotency(prisma, {
+        organizationId: req.currentOrganizationUser.organizationId,
+        scope: 'orders.checkout',
+        idempotencyKey: req.headers['idempotency-key'] as string,
+        requestFingerprint: computeRequestFingerprint(req),
+        ttlMinutes: 1440,
+    }, async (tx) => {
+        // All business mutations MUST use tx to guarantee ACID atomicity
+        const order = await tx.order.create({ data: req.body });
+        return { httpCode: 201, body: order, headers: { location: `/orders/${order.id}` } };
+    });
+
+    if (result.headers) {
+        Object.entries(result.headers).forEach(([k, v]) => res.setHeader(k, v));
     }
-    return result;
-}
-
-function computeRequestFingerprint(req: Request): string {
-    const payload = {
-        method: req.method.toUpperCase(),
-        route: req.baseUrl + (req.route?.path ?? req.path),
-        params: canonicalize(req.params),
-        query: canonicalize(req.query),
-        body: canonicalize(req.body),
-    };
-    return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
-}
-
-//? Atomic Lua script to compare and delete pending lease only if owner token matches
-const COMPARE_AND_DELETE_LUA = `
-local raw = redis.call('GET', KEYS[1])
-if not raw then return 0 end
-local cjson_ok, record = pcall(cjson.decode, raw)
-if cjson_ok and record and record.ownerToken == ARGV[1] then
-    return redis.call('DEL', KEYS[1])
-else
-    return -1
-end
-`;
-
-export function cacheIdempotencyMiddleware(options: {
-    pendingTtlSeconds?: number;
-    completedTtlSeconds?: number;
-    failClosed?: boolean;
-} = {}) {
-    const { pendingTtlSeconds = 60, completedTtlSeconds = 86400, failClosed = true } = options;
-
-    return async (req: Request, res: Response, next: NextFunction) => {
-        const rawKey = req.header('Idempotency-Key');
-        if (!rawKey) return next();
-
-        // 1. Parse and validate key boundary via Zod
-        const keyParsed = IdempotencyKeySchema.safeParse(rawKey);
-        if (!keyParsed.success) {
-            return sendError(res, keyParsed.error.errors[0]?.message ?? 'Invalid Idempotency-Key', 400);
-        }
-        const idempotencyKey = keyParsed.data;
-
-        // 2. Scope prevents cross-route or cross-tenant key collisions
-        const orgId = req.currentOrganizationUser?.organizationId ?? 'public';
-        const userId = req.currentOrganizationUser?.userId ?? 'anon';
-        const routePath = req.baseUrl + (req.route?.path ?? req.path);
-        const redisKey = `idempotency:${orgId}:${userId}:${req.method.toUpperCase()}:${routePath}:${idempotencyKey}`;
-        const currentFingerprint = computeRequestFingerprint(req);
-        const ownerToken = crypto.randomUUID();
-
-        const redis = getRedisConnection('cache');
-
-        try {
-            // 3. Acquire short pending lease (prevents 24h lockout if server crashes mid-mutation)
-            const initialRecord = { status: 'pending', ownerToken, fingerprint: currentFingerprint };
-            const acquired = await redis.set(redisKey, JSON.stringify(initialRecord), 'EX', pendingTtlSeconds, 'NX');
-            
-            if (!acquired) {
-                const existing = await redis.get(redisKey);
-                
-                //! Critical: If lock failed and record is missing, do NOT proceed to mutation (concurrency race)
-                if (!existing) {
-                    return sendError(res, 'Concurrent request in progress. Please retry.', 409);
-                }
-
-                const parsed = JSON.parse(existing);
-
-                //! Conflict: Key reused with different payload/parameters
-                if (parsed.fingerprint !== currentFingerprint) {
-                    return sendError(res, 'Idempotency key reused with a different request payload or parameters.', 422);
-                }
-
-                if (parsed.status === 'completed' && typeof parsed.httpCode === 'number') {
-                    res.setHeader('X-Cache-Lookup', 'HIT - Idempotent Replay');
-                    return res.status(parsed.httpCode).json(parsed.body);
-                }
-                if (parsed.status === 'pending') {
-                    return sendError(res, 'A request with this idempotency key is currently in flight.', 409);
-                }
-            }
-
-            // 4. Intercept and AWAIT persistence before sending HTTP response
-            const originalJson = res.json.bind(res);
-            const originalSend = res.send.bind(res);
-            let responseHandled = false;
-
-            const persistResponse = async (statusCode: number, body: unknown) => {
-                try {
-                    if (statusCode >= 200 && statusCode < 300) {
-                        await redis.set(
-                            redisKey,
-                            JSON.stringify({ status: 'completed', ownerToken, httpCode: statusCode, fingerprint: currentFingerprint, body }),
-                            'EX',
-                            completedTtlSeconds,
-                        );
-                    } else {
-                        // Compare-and-delete: only delete if THIS ownerToken still owns the key (prevents deleting next lease)
-                        await redis.eval(COMPARE_AND_DELETE_LUA, 1, redisKey, ownerToken);
-                    }
-                } catch (persistErr) {
-                    logger.error('[Idempotency] Failed to persist completion state:', persistErr);
-                }
-            };
-
-            const captureAndSend = (body: unknown, sender: (data: unknown) => Response, isJson: boolean): Response => {
-                if (responseHandled) return sender(body);
-                responseHandled = true;
-
-                void persistResponse(res.statusCode, body).then(() => {
-                    sender(body);
-                });
-                return res;
-            };
-
-            res.json = (body: unknown): Response => captureAndSend(body, originalJson, true);
-            res.send = (body: unknown): Response => captureAndSend(body, originalSend, false);
-
-            next();
-        } catch (err) {
-            //! Financial safety: fail-closed to prevent duplicate mutations during cache downtime
-            if (failClosed) {
-                return sendError(res, 'Idempotency service temporarily unavailable. Transaction aborted.', 503);
-            }
-            next();
-        }
-    };
+    if (result.isReplay) {
+        res.setHeader('X-Cache-Lookup', 'HIT - Idempotent Replay');
+    }
+    return res.status(result.httpCode).json(result.data);
 }
 ```
-*For high-value financial transactions, use the durable PostgreSQL implementation (`executeWithDbIdempotency` in `examples/resilience/idempotency.ts`). It guarantees transactional safety by construction: `operation(tx)` receives the transaction client `tx`, binds mutations and idempotency records within the same ACID boundary, and safely replays 204 No Content/null/empty responses without risk of duplicate execution.*
 
 ### Pattern B: Transactional Outbox Pattern
 ```typescript

@@ -48,55 +48,46 @@ export function verifyWebhookSignature(options: {
 ### The Vulnerability: In-Memory File Buffering
 Loading large CSVs, audio files, or PDF reports into memory via `fs.readFileSync` or accumulating arrays (`records.push(row)`) causes massive V8 heap spikes. In containerized environments with 512MB-1GB limits, processing a 50MB file can expand into an 8x memory footprint, crashing Node.js with `JavaScript heap out of memory`.
 
-### The Production Standard: `stream.pipeline` with Async Generators
-Use Node.js `stream.pipeline` with async generators (or properly error-handled `Transform` streams). `stream.pipeline` manages **backpressure**: if downstream processing slows down, the upstream file reader automatically pauses reading from disk.
+### The Production Standard: `stream.pipeline` with Line Framing & StringDecoder
+Stream chunks arrive on arbitrary byte boundaries, not line or record boundaries, and multi-byte UTF-8 characters can be split across chunks. Use `stream.pipeline` with an async generator using `StringDecoder` and line buffering to guarantee safe parsing under backpressure:
 
 ```typescript
 import { pipeline } from 'node:stream/promises';
-import { Transform } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import fs from 'node:fs';
 
-// Pattern A: Idiomatic Node.js Async Generator Pipeline Stage
-export async function streamWithAsyncGenerator(
+export async function streamLinesWithPipeline(
   inputFilePath: string,
   outputFilePath: string,
   processLine: (line: string) => Promise<string>
 ): Promise<void> {
-  async function* transformStage(source: AsyncIterable<Buffer>) {
+  async function* lineFramingStage(source: AsyncIterable<Buffer>) {
+    const decoder = new StringDecoder('utf8');
+    let remainder = '';
+
     for await (const chunk of source) {
-      const transformed = await processLine(chunk.toString('utf8'));
-      yield Buffer.from(transformed, 'utf8');
+      // StringDecoder preserves incomplete multi-byte UTF-8 character bytes until next chunk
+      remainder += decoder.write(chunk);
+      const lines = remainder.split(/\r?\n/);
+      remainder = lines.pop() ?? ''; // Buffer incomplete trailing fragment
+
+      for (const line of lines) {
+        const transformed = await processLine(line);
+        yield Buffer.from(transformed + '\n', 'utf8');
+      }
+    }
+
+    remainder += decoder.end();
+    if (remainder.length > 0) {
+      const transformed = await processLine(remainder);
+      yield Buffer.from(transformed + '\n', 'utf8');
     }
   }
 
+  // Automatically manages backpressure, teardown, and error propagation
   await pipeline(
     fs.createReadStream(inputFilePath),
-    transformStage,
-    fs.createWriteStream(outputFilePath)
-  );
-}
-
-// Pattern B: Transform Stream with Explicit Stream Error Handling
-export async function streamWithTransform(
-  inputFilePath: string,
-  outputFilePath: string,
-  processChunk: (raw: string) => string
-): Promise<void> {
-  const lineTransformer = new Transform({
-    transform(chunk: Buffer, _encoding, callback) {
-      try {
-        const transformed = processChunk(chunk.toString('utf8'));
-        callback(null, Buffer.from(transformed, 'utf8'));
-      } catch (err) {
-        // Enforce stream contract: error MUST be passed to callback
-        callback(err instanceof Error ? err : new Error(String(err)));
-      }
-    },
-  });
-
-  await pipeline(
-    fs.createReadStream(inputFilePath),
-    lineTransformer,
+    lineFramingStage,
     fs.createWriteStream(outputFilePath)
   );
 }

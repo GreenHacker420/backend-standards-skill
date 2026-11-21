@@ -1,4 +1,4 @@
-import { pipeline } from 'node:stream/promises';
+import { pipeline, finished } from 'node:stream/promises';
 import { StringDecoder } from 'node:string_decoder';
 import readline from 'node:readline';
 import fs from 'node:fs';
@@ -11,43 +11,11 @@ import fs from 'node:fs';
  */
 
 /**
- * Approach 1: Line-by-Line Processing with node:readline
+ * Approach 1: Composable Async Generator Pipeline with StringDecoder (Recommended Standard)
  * 
- * Recommended for line-oriented data (CSV, JSONL, logs).
- * node:readline automatically handles line framing across arbitrary byte chunks,
- * CRLF/LF normalization, and multi-byte UTF-8 character splitting.
- */
-export async function streamLinesWithReadline(
-  inputFilePath: string,
-  outputFilePath: string,
-  processLine: (line: string) => Promise<string>
-): Promise<void> {
-  const readStream = fs.createReadStream(inputFilePath);
-  const writeStream = fs.createWriteStream(outputFilePath);
-  const rl = readline.createInterface({
-    input: readStream,
-    crlfDelay: Infinity, // Normalizes \r\n and \n
-  });
-
-  try {
-    for await (const line of rl) {
-      const transformed = await processLine(line);
-      const canWrite = writeStream.write(transformed + '\n');
-      if (!canWrite) {
-        // Enforce backpressure when kernel write buffer is full
-        await new Promise((resolve) => writeStream.once('drain', resolve));
-      }
-    }
-  } finally {
-    writeStream.end();
-  }
-}
-
-/**
- * Approach 2: Composable Async Generator Pipeline with StringDecoder
- * 
- * Uses StringDecoder to safely assemble UTF-8 characters and frames newline-delimited
- * records across arbitrary stream chunk boundaries before processing.
+ * Uses StringDecoder to safely assemble UTF-8 characters across arbitrary byte chunks
+ * and frames newline-delimited records with pipeline() managing end-to-end backpressure,
+ * resource teardown, and error propagation automatically.
  */
 export async function streamLinesWithPipeline(
   inputFilePath: string,
@@ -84,4 +52,40 @@ export async function streamLinesWithPipeline(
     lineFramingStage,
     fs.createWriteStream(outputFilePath)
   );
+}
+
+/**
+ * Approach 2: Line-by-Line Processing with node:readline
+ * 
+ * Alternative approach using readline. Explicitly awaits finished(writeStream)
+ * and drains write buffers to guarantee all bytes reach disk before resolution.
+ */
+export async function streamLinesWithReadline(
+  inputFilePath: string,
+  outputFilePath: string,
+  processLine: (line: string) => Promise<string>
+): Promise<void> {
+  const readStream = fs.createReadStream(inputFilePath);
+  const writeStream = fs.createWriteStream(outputFilePath);
+  const rl = readline.createInterface({
+    input: readStream,
+    crlfDelay: Infinity, // Normalizes \r\n and \n
+  });
+
+  try {
+    for await (const line of rl) {
+      const transformed = await processLine(line);
+      const canWrite = writeStream.write(transformed + '\n');
+      if (!canWrite) {
+        // Enforce backpressure when kernel write buffer is full
+        await new Promise((resolve) => writeStream.once('drain', resolve));
+      }
+    }
+    writeStream.end();
+    // Await finish event so write errors are captured and file descriptor closes cleanly
+    await finished(writeStream);
+  } catch (err) {
+    writeStream.destroy();
+    throw err;
+  }
 }
