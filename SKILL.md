@@ -58,6 +58,11 @@ When authoring backend code, adhere strictly to these core principles:
 17. **Semantic Commenting Taxonomy**: Use visual semantic tags (`//?`, `//!`, `//&`, `//*`) to clearly convey rationale, critical hazards, domain boundaries, and business constraints.
 18. **Fail-Fast Boot**: Validate all environment variables and secrets at application boot using Zod. The server must crash immediately on boot if configuration is missing or malformed.
 19. **Type-Safe API Contracts**: Use generic response formatting helpers (`sendResponse<T>`, `sendArrayResponse<T>`, `sendError`) across all HTTP endpoints.
+20. **Modular & Vertical Slice Architecture**: Structure large domain systems into feature-oriented modules (`src/modules/<feature>/`) that encapsulate their own routes, actions, orchestrators, schemas, and repositories, rather than sprawling horizontal layers.
+21. **Tail-Based Tracing**: Buffer in-flight spans in-memory and evaluate sampling decisions at request completion to capture 100% of errors and p99 latency spikes while downsampling healthy fast requests.
+22. **Retry Budgets & Preventing Retry Storms**: Enforce a token bucket retry budget (max 10% retries) with Full Jitter backoff and strict transient vs terminal error classification to prevent retry storms.
+23. **Dead Letter Queue (DLQ) & Poison Pill Quarantine**: Quarantine unprocessable queue messages after max attempts and provide administrative re-drive capabilities.
+24. **Singleflight (Cache Stampede Prevention)**: Coalesce concurrent in-flight requests for identical keys to protect downstream databases from thundering herds.
 
 ---
 
@@ -109,6 +114,55 @@ src/
 ├── socket/                        # Socket.IO initialization and namespace handlers
 └── utils/                         # Redis connection helpers, retry utilities, crypto, formatters
 ```
+
+### Pattern B: Modular (Vertical Slice / Feature-First) Architecture Standard
+For medium-to-large services with multiple bounded contexts, organize by **Feature Module** rather than technical layer to achieve maximum cohesion:
+
+```
+src/
+├── core/                               # Cross-cutting platform infrastructure
+│   ├── database/                       # Prisma client, bulkheaded pools, outbox relay
+│   ├── observability/                  # AsyncLocalStorage, tracing, metrics, logger
+│   ├── resilience/                     # Circuit breaker, retry budget, degradation manager
+│   ├── errors/                         # AppError, error codes, global error handler
+│   └── middleware/                     # Auth guard, rate limiter, idempotency, trace context
+│
+├── modules/                            # Domain modules (vertical slices)
+│   ├── orders/
+│   │   ├── orders.routes.ts            # Routes definitions for /api/v1/orders
+│   │   ├── actions/                    # Single-action controllers (1 file = 1 endpoint)
+│   │   │   ├── create-order.action.ts
+│   │   │   ├── get-order.action.ts
+│   │   │   └── cancel-order.action.ts
+│   │   ├── orchestrators/              # Domain logic & transactional workflows
+│   │   │   └── order-orchestrator.ts
+│   │   ├── schemas/                    # Zod schemas & inferred TypeScript DTOs
+│   │   │   └── order.schema.ts
+│   │   ├── repositories/               # Domain-specific database queries
+│   │   │   └── order.repository.ts
+│   │   └── index.ts                    # Public API contract exported to other modules
+│   │
+│   ├── tickets/
+│   │   ├── tickets.routes.ts
+│   │   ├── actions/
+│   │   ├── orchestrators/
+│   │   └── index.ts
+│   │
+│   └── identity/
+│       ├── identity.routes.ts
+│       ├── actions/
+│       └── index.ts
+│
+├── app.ts                              # Express app bootstrap, mounting core middleware & module routers
+└── server.ts                           # HTTP server listen & graceful shutdown coordinator
+```
+
+#### Inviolable Rules of Modular Architecture
+1. **High Cohesion, Low Coupling**: All files required for a feature live together inside `src/modules/<feature>/`.
+2. **No Direct Cross-Module DB Queries**: Module A (`orders`) must **never** query Module B (`tickets`) database tables directly. Communicate via exported interfaces in `index.ts` or asynchronous outbox events.
+3. **Preserve Single-Action Controllers**: Inside `actions/`, each file exports a single endpoint handler. Never create bloated controller classes.
+
+---
 
 ---
 
@@ -317,6 +371,27 @@ new Worker('orders', async (job) => {
 });
 ```
 
+### E. Tail-Based Tracing & Adaptive Sampling
+Unlike head-based sampling which makes a random sampling decision at request entry (losing critical traces when errors or latency spikes occur), **Tail-Based Sampling** buffers in-flight trace spans and evaluates them when the root request terminates:
+
+1. **Error Rule:** Any trace with `statusCode >= 500` or an unhandled exception $\to$ **100% Sampled**.
+2. **Latency Rule:** Any trace exceeding SLA/p99 duration (e.g. `> 1000ms`) $\to$ **100% Sampled**.
+3. **Critical Tier Rule:** Any request touching Tier 0 services (Auth, Checkout) $\to$ **100% Sampled**.
+4. **Fast Baseline Rule:** Fast `200 OK` requests (< 50ms) $\to$ **Downsampled to 1%** (sufficient for baseline percentiles).
+
+```typescript
+// See examples/observability/tail-sampler.ts for the complete implementation.
+export class TailSampler {
+    public evaluateTrace(traceId: string, meta: { statusCode: number; durationMs: number; tier?: number }) {
+        if (meta.statusCode >= 500) return { sampled: true, reason: 'error_occurred' };
+        if (meta.durationMs >= 1000) return { sampled: true, reason: 'latency_violation' };
+        if (meta.tier === 0) return { sampled: true, reason: 'tier_0_critical' };
+        if (Math.random() < 0.01) return { sampled: true, reason: 'probabilistic_baseline' };
+        return { sampled: false, reason: 'dropped_healthy' };
+    }
+}
+```
+
 ---
 
 ## 5. Semantic Commenting Taxonomy (`Better Comments` Style)
@@ -461,6 +536,59 @@ export async function withRetry<T>(
             await new Promise((resolve) => setTimeout(resolve, delay));
         }
     }
+}
+```
+
+### Advanced Failure Recovery: Token-Bucket Retry Budget & Full Jitter
+To prevent cascading retry storms where layered services multiply retries ($3 \times 3 \times 3 = 27\times$ load), enforce Google SRE retry budgets:
+1. Retries must never exceed **10% of total outbound requests** in any 60-second window.
+2. Use **Full Jitter** (`random(0, min(cap, base * 2^attempt))`) so clients do not retry in synchronized waves.
+3. See `examples/resilience/retry-budget.ts` for the full implementation.
+
+### Strict Error Classification Matrix
+
+| Category | HTTP / System Codes | Retry Action | Strategy |
+| :--- | :--- | :---: | :--- |
+| **Transient** | `503`, `429`, `ECONNRESET`, `ETIMEDOUT` | ✅ Retry | Retry with Full Jitter, deduct from Retry Budget, honor `Retry-After`. |
+| **Terminal / Client** | `400`, `401`, `403`, `404`, `422` | ❌ Do NOT Retry | Fail fast immediately. Retrying bad input wastes CPU and bandwidth. |
+| **Non-Idempotent** | Unkeyed `POST`, payment charges | ❌ Do NOT Retry | **Never retry without an `Idempotency-Key`**. |
+| **Internal Server Error** | `500 Internal Server Error` | ⚠️ Max 1 | Often indicative of application bugs. Retry at most once if idempotent. |
+
+### Dead Letter Queue (DLQ) & Poison Pill Quarantine
+When consuming background queues (BullMQ, Kafka):
+1. If a job fails after $N$ attempts (e.g. 5 attempts) due to a malformed payload or poison pill, eject it to `{queueName}-dlq`.
+2. Store the input payload, full stack trace, attempt timestamps, and `traceId` on the DLQ record.
+3. Provide an administrative re-drive API (`POST /api/v1/admin/queues/:name/redrive`) to replay failed messages once code fixes land.
+
+### Singleflight (Cache Stampede Prevention)
+When a high-traffic cache key expires, thousands of concurrent requests can overwhelm the primary database (cache stampede). Use **Singleflight** (Promise coalescing) so that concurrent requests for the same key share a single in-flight Promise:
+```typescript
+// See examples/resilience/singleflight.ts
+import { singleflight } from '@/shared/classes/singleflight';
+
+export async function getCachedProduct(productId: string) {
+    return singleflight.do(`product:${productId}`, async () => {
+        const cached = await cache.get(`product:${productId}`);
+        if (cached) return cached;
+        const fresh = await prisma.product.findUnique({ where: { id: productId } });
+        await cache.set(`product:${productId}`, fresh, 300);
+        return fresh;
+    });
+}
+```
+
+### Request Deadline & Cancellation Propagation
+If a client disconnects before a request finishes, abort downstream work immediately to free database locks:
+```typescript
+export function cancellationMiddleware(req: Request, res: Response, next: NextFunction) {
+    const ac = new AbortController();
+    req.on('close', () => {
+        if (!res.writableEnded) {
+            ac.abort(); // Signals database and external fetch clients to abort execution
+        }
+    });
+    (req as any).abortSignal = ac.signal;
+    next();
 }
 ```
 
@@ -698,9 +826,21 @@ Never embed business parameters, tenant permissions, or pricing caps directly in
 - **Do** use semantic comment tags (`//?`, `//!`, `//&`, `//*`) to document rationale and constraints.
 - **Do** verify feature limits and permissions dynamically from database records (zero hardcoded rules).
 - **Do** use `sendResponse<T>`, `sendArrayResponse<T>`, and `sendError` for all HTTP responses.
+- **Do** organize bounded contexts into Modular Vertical Slices (`src/modules/<domain>/`) for high cohesion and easy maintenance.
+- **Do** implement Tail-Based Sampling to guarantee 100% trace retention for errors and p99 latency spikes.
+- **Do** enforce a Token-Bucket Retry Budget (max 10% retries) to avoid retry storms during downstream degradation.
+- **Do** use Full Jitter for exponential backoff to avoid synchronized client retry waves.
+- **Do** quarantine poison pill payloads into a Dead Letter Queue (DLQ) with metadata.
+- **Do** use Singleflight promise coalescing to prevent cache stampedes on hot keys.
+- **Do** propagate request cancellations (`req.on('close')`) to abort downstream database queries when clients disconnect.
 
 ### ❌ DON'Ts:
 - **Never** allow a Tier-0 checkout endpoint to synchronously await a Tier-2 recommendation or AI call.
+- **Never** query another module's database tables directly in a modular architecture (use public module interfaces).
+- **Never** perform dual writes (e.g. updating Postgres then publishing directly to Kafka/Rabbit/BullMQ without an outbox).
+- **Never** retry without an Idempotency-Key on non-idempotent mutations.
+- **Never** retry without jitter or beyond the 10% retry budget.
+- **Never** rely purely on random head-based sampling if you need visibility into rare production errors.
 - **Never** perform dual writes (e.g. updating Postgres then publishing directly to Kafka/Rabbit/BullMQ without an outbox).
 - **Never** leave floating promises un-awaited or without a `.catch()` handler.
 - **Never** swallow errors silently (`catch (e) {}`) without logging or proper handling.

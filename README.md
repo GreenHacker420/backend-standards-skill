@@ -77,6 +77,10 @@ This repository codifies the architectural discipline to eliminate these problem
 5. **Action-Based Controllers**: 1 file per endpoint (`create.ts`, `update.ts`, `delete.ts`) with co-located Zod schemas and inferred DTOs.
 6. **Dual-Write Prevention**: Transactional Outbox pattern guarantees eventual consistency between PostgreSQL and background queue dispatch.
 7. **Resilient Retries & Circuit Breakers**: Exponential backoff with randomized jitter (`withRetry`) and 3-state circuit breakers for flaky vendor APIs.
+8. **Modular & Vertical Slice Architecture**: Structure complex systems into feature modules (`src/modules/<feature>/`) that encapsulate their own routes, actions, and schemas.
+9. **Tail-Based Tracing**: Buffer in-flight spans and sample 100% of errors and p99 latency spikes while downsampling healthy fast paths.
+10. **Retry Storm Prevention (Retry Budgets)**: Enforce a rolling token bucket (max 10% retries) with Full Jitter to avoid compounding outages.
+11. **Singleflight (Cache Stampede Prevention)**: Coalesce concurrent cache-miss requests into a single database promise.
 
 ---
 
@@ -87,15 +91,19 @@ This repository codifies the architectural discipline to eliminate these problem
 ├── SKILL.md                       # Master single-file skill for AI Agents (Antigravity / Claude Code / Cursor)
 ├── examples/                      # Compilable, production-ready TypeScript reference implementations
 │   ├── controllers/               # 1-action controller templates with Zod DTOs
+│   ├── modular/                   # Modular Vertical Slice architecture example (orders module)
 │   ├── orchestrators/             # Domain orchestrators decoupled from HTTP transport
-│   ├── observability/             # AsyncLocalStorage request context, tracing middleware, logger
-│   ├── resilience/                # DegradationManager, circuit breaker, retry, idempotency
+│   ├── observability/             # AsyncLocalStorage request context, tracing, tail-sampler, logger
+│   ├── resilience/                # Retry budget, singleflight, degradation manager, circuit breaker
 │   └── database/                  # Bulkheaded Prisma pools, transactional outbox relay
 ├── references/                    # Deep architectural design specifications
 │   ├── 01-service-criticality-and-load-shedding.md
 │   ├── 02-distributed-tracing-and-observability.md
 │   ├── 03-zero-hardcoding-database-rules.md
-│   └── 04-error-handling-and-retries.md
+│   ├── 04-error-handling-and-retries.md
+│   ├── 05-modular-vertical-slice-architecture.md
+│   ├── 06-tail-sampling-and-advanced-tracing.md
+│   └── 07-failure-recovery-retry-budgets-dlq.md
 └── package.json
 ```
 
