@@ -2,9 +2,20 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![TypeScript: Strict](https://img.shields.io/badge/TypeScript-Strict-blue.svg)](https://www.typescriptlang.org/)
-[![Antigravity Skill](https://img.shields.io/badge/Antigravity-Compatible-orange.svg)](https://github.com/)
+[![skills.sh](https://img.shields.io/badge/skills.sh-indexed-success.svg)](https://skills.sh/)
+[![Antigravity](https://img.shields.io/badge/Antigravity-Compatible-orange.svg)](https://github.com/)
 
 An opinionated, battle-tested architectural specification, coding standard, and autonomous agent skill for building enterprise-grade, scalable, and maintainable Node.js & TypeScript backends.
+
+---
+
+## ⚡ Quick Install
+
+Install this skill into your project for any AI coding agent (**Google Antigravity**, **Cursor**, **Claude Code**, **Copilot**, etc.) via `npx skills`:
+
+```bash
+npx skills add GreenHacker420/backend-standards-skill
+```
 
 ---
 
@@ -90,23 +101,37 @@ This repository codifies the architectural discipline to eliminate these problem
 
 ---
 
-## 🚀 Installation via `npx skills`
+## 🚀 Installation & Agent Setup
 
-You can install this skill into your agent workspace (Antigravity, Cursor, Claude Code, etc.) with a single command:
+### Option 1: Package Manager for Skills (`npx skills`)
+
+The easiest way to install and keep this skill updated across your projects:
 
 ```bash
-# Install to current project
+# 1. Install to current project (recommended)
 npx skills add GreenHacker420/backend-standards-skill
 
-# Or install globally across all your projects
+# 2. Install globally (available across all your projects on your machine)
 npx skills add GreenHacker420/backend-standards-skill -g
+
+# 3. Target specific agents (e.g. Antigravity, Cursor, Claude Code)
+npx skills add GreenHacker420/backend-standards-skill -a antigravity cursor claude-code
+
+# 4. Non-interactive / CI setup (skip prompts)
+npx skills add GreenHacker420/backend-standards-skill -y
+
+# 5. List available skills in this repo without installing
+npx skills add GreenHacker420/backend-standards-skill -l
+
+# 6. One-off use without installing
+npx skills use GreenHacker420/backend-standards-skill@backend
 ```
 
 ---
 
-## 🚀 Manual Installation
+### Option 2: Manual Installation
 
-### In Google Antigravity
+#### In Google Antigravity
 Copy `SKILL.md` into your global or project skills directory:
 ```bash
 # Global installation (available to all your agents)
@@ -118,8 +143,8 @@ mkdir -p .agents/skills/backend
 cp SKILL.md .agents/skills/backend/
 ```
 
-### In Claude Code / Cursor / Other Coding Agents
-Reference `SKILL.md` in your project's `.cursorrules`, `CLAUDE.md`, or system prompts.
+#### In Cursor / Claude Code / Windsurf / Copilot
+Reference `SKILL.md` in your project's `.cursorrules`, `CLAUDE.md`, or system prompt files.
 
 ---
 
