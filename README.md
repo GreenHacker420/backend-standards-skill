@@ -90,7 +90,21 @@ This repository codifies the architectural discipline to eliminate these problem
 
 ---
 
-## 🚀 How to Install & Use as an Agent Skill
+## 🚀 Installation via `npx skills`
+
+You can install this skill into your agent workspace (Antigravity, Cursor, Claude Code, etc.) with a single command:
+
+```bash
+# Install to current project
+npx skills add GreenHacker420/backend-standards-skill
+
+# Or install globally across all your projects
+npx skills add GreenHacker420/backend-standards-skill -g
+```
+
+---
+
+## 🚀 Manual Installation
 
 ### In Google Antigravity
 Copy `SKILL.md` into your global or project skills directory:
