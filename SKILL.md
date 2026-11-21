@@ -315,23 +315,52 @@ export const requestContext = new RequestContextStore();
 ```typescript
 import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import { z } from 'zod';
 import { requestContext, TraceContext } from '@/shared/classes/request-context';
 
-const W3C_TRACEPARENT_REGEX = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
-const SAFE_ID_REGEX = /^[a-zA-Z0-9_-]{16,64}$/;
+//? W3C Trace Context schema enforcing RFC length and non-zero invariants
+export const W3CTraceparentSchema = z
+    .string()
+    .trim()
+    .length(55, 'W3C traceparent must be exactly 55 characters')
+    .regex(/^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/i, 'Invalid W3C traceparent structure')
+    .superRefine((val, ctx) => {
+        const parts = val.split('-');
+        const traceId = parts[1]?.toLowerCase();
+        const parentId = parts[2]?.toLowerCase();
+        //! W3C Invariant: Trace ID and Parent ID cannot be all zeros
+        if (traceId === '00000000000000000000000000000000') {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'trace_id cannot be all zeros' });
+        }
+        if (parentId === '0000000000000000') {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'parent_id cannot be all zeros' });
+        }
+    })
+    .transform((val) => val.split('-')[1].toLowerCase());
+
+//? Safe correlation ID schema preventing header injection and ReDoS attacks
+export const SafeCorrelationIdSchema = z
+    .string()
+    .trim()
+    .min(16, 'Correlation ID must be at least 16 characters')
+    .max(64, 'Correlation ID must be at most 64 characters')
+    .regex(/^[a-zA-Z0-9_-]+$/, 'Correlation ID must contain only alphanumeric, underscore, or hyphen');
 
 function extractTraceId(req: Request): string {
-    const traceparent = req.header('traceparent');
-    if (traceparent) {
-        const match = W3C_TRACEPARENT_REGEX.exec(traceparent.trim());
-        if (match && match[1] !== '00000000000000000000000000000000') {
-            return match[1].toLowerCase();
+    const rawTraceparent = req.header('traceparent');
+    if (rawTraceparent) {
+        const parseResult = W3CTraceparentSchema.safeParse(rawTraceparent);
+        if (parseResult.success) {
+            return parseResult.data;
         }
     }
 
-    const customTraceId = req.header('x-trace-id');
-    if (customTraceId && SAFE_ID_REGEX.test(customTraceId.trim())) {
-        return customTraceId.trim();
+    const rawCustomTraceId = req.header('x-trace-id');
+    if (rawCustomTraceId) {
+        const parseResult = SafeCorrelationIdSchema.safeParse(rawCustomTraceId);
+        if (parseResult.success) {
+            return parseResult.data;
+        }
     }
 
     return uuidv4().replace(/-/g, '').toLowerCase();
@@ -339,10 +368,9 @@ function extractTraceId(req: Request): string {
 
 export function tracingMiddleware(req: Request, res: Response, next: NextFunction) {
     const traceId = extractTraceId(req);
-    const incomingRequestId = req.header('x-request-id');
-    const requestId = (incomingRequestId && SAFE_ID_REGEX.test(incomingRequestId.trim()))
-        ? incomingRequestId.trim()
-        : uuidv4();
+    const rawRequestId = req.header('x-request-id');
+    const reqParse = rawRequestId ? SafeCorrelationIdSchema.safeParse(rawRequestId) : null;
+    const requestId = reqParse?.success ? reqParse.data : uuidv4();
     const startTime = Date.now();
 
     const context: TraceContext = { traceId, requestId, startTime };
@@ -536,28 +564,42 @@ export class APIError extends BaseError {
 }
 ```
 
-### Exponential Backoff & Jitter (`withRetry`)
+### Exponential Backoff & AWS Full Jitter (`withRetry`)
 ```typescript
 // src/utils/retry.ts
 import { logger } from '@/shared/logger';
 
 export interface RetryOptions {
-    retries?: number;
-    minDelayMs?: number;
-    maxDelayMs?: number;
-    factor?: number;
-    jitter?: boolean;
-    shouldRetry?: (error: unknown, attempt: number) => boolean;
-    onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
+    readonly retries?: number;
+    readonly minDelayMs?: number;
+    readonly maxDelayMs?: number;
+    readonly factor?: number;
+    readonly jitter?: boolean;       //? When true, applies AWS Full Jitter to eliminate thundering herds
+    readonly isIdempotent?: boolean; //* Business Rule: Permits 1 cautious retry on HTTP 500 if mutation is idempotent
+    readonly shouldRetry?: (error: unknown, attempt: number) => boolean;
+    readonly onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
 }
 
-export function isTransientError(error: unknown): boolean {
+export function extractRetryAfterMs(error: unknown): number | null {
+    if (!error || typeof error !== 'object' || !('response' in error)) return null;
+    const res = (error as { response?: { headers?: Record<string, string | string[]> } }).response;
+    const header = res?.headers?.['retry-after'];
+    if (!header) return null;
+    const val = Array.isArray(header) ? header[0] : header;
+    const seconds = Number(val);
+    if (!Number.isNaN(seconds) && seconds > 0) return seconds * 1000;
+    const dateMs = Date.parse(val);
+    return !Number.isNaN(dateMs) && dateMs > Date.now() ? dateMs - Date.now() : null;
+}
+
+export function isTransientError(error: unknown, attempt: number, isIdempotent = false): boolean {
     if (!error || typeof error !== 'object') return false;
 
     // HTTP 429, 502, 503, 504
     if ('response' in error && error.response && typeof error.response === 'object') {
         const status = (error.response as { status?: number }).status;
         if (status === 429 || (status !== undefined && status >= 502 && status <= 504)) return true;
+        if (status === 500 && isIdempotent && attempt === 1) return true;
         if (status !== undefined && status >= 400 && status < 500) return false;
     }
 
@@ -584,7 +626,8 @@ export async function withRetry<T>(
         maxDelayMs = 10000,
         factor = 2,
         jitter = true,
-        shouldRetry = isTransientError,
+        isIdempotent = false,
+        shouldRetry = (err, att) => isTransientError(err, att, isIdempotent),
         onRetry,
     } = options;
 
@@ -599,15 +642,28 @@ export async function withRetry<T>(
                 throw error;
             }
 
-            let delay = Math.min(maxDelayMs, minDelayMs * Math.pow(factor, attempt - 1));
-            if (jitter) {
-                delay += Math.random() * delay * 0.3;
+            //? Bounded exponential ceiling
+            const ceiling = Math.min(maxDelayMs, minDelayMs * Math.pow(factor, attempt - 1));
+
+            //? AWS Full Jitter: Uniform random distribution between 0 and ceiling
+            let delay = jitter ? Math.random() * ceiling : ceiling;
+
+            //? Honor upstream Retry-After with jitter smoothing
+            const retryAfterMs = extractRetryAfterMs(error);
+            if (retryAfterMs !== null) {
+                const bounded = Math.min(maxDelayMs, retryAfterMs);
+                delay = jitter ? bounded + Math.random() * Math.min(1000, bounded * 0.1) : bounded;
             }
 
             if (onRetry) {
                 onRetry(error, attempt, delay);
             } else {
-                logger.warn(`[Retry] Attempt ${attempt}/${retries} failed. Retrying in ${Math.round(delay)}ms...`);
+                logger.warn(`[Retry] Attempt ${attempt}/${retries} failed. Retrying in ${Math.round(delay)}ms...`, {
+                    attempt,
+                    retries,
+                    delayMs: Math.round(delay),
+                    jitter,
+                });
             }
 
             await new Promise((resolve) => setTimeout(resolve, delay));
@@ -688,8 +744,17 @@ export function cancellationMiddleware(req: Request, res: Response, next: NextFu
 // src/middlewares/idempotency.ts
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'node:crypto';
+import { z } from 'zod';
 import { getRedisConnection } from '@/utils/redisConnection';
 import { sendError } from '@/shared/standard-api-responses/send-error';
+
+//? Zod boundary validation prevents header injection and ReDoS
+export const IdempotencyKeySchema = z
+    .string()
+    .trim()
+    .min(16, 'Idempotency key must be at least 16 characters')
+    .max(64, 'Idempotency key must be at most 64 characters')
+    .regex(/^[a-zA-Z0-9_-]+$/, 'Idempotency key must contain only URL-safe alphanumeric characters');
 
 function computePayloadHash(payload: unknown): string {
     if (!payload || (typeof payload === 'object' && Object.keys(payload).length === 0)) {
@@ -703,10 +768,17 @@ export function idempotencyMiddleware(options: { ttlSeconds?: number; failClosed
     const { ttlSeconds = 86400, failClosed = true } = options;
 
     return async (req: Request, res: Response, next: NextFunction) => {
-        const idempotencyKey = req.header('Idempotency-Key');
-        if (!idempotencyKey) return next();
+        const rawKey = req.header('Idempotency-Key');
+        if (!rawKey) return next();
 
-        // 1. Scope prevents cross-route or cross-tenant key collisions
+        // 1. Parse and validate key boundary via Zod
+        const keyParsed = IdempotencyKeySchema.safeParse(rawKey);
+        if (!keyParsed.success) {
+            return sendError(res, keyParsed.error.errors[0]?.message ?? 'Invalid Idempotency-Key', 400);
+        }
+        const idempotencyKey = keyParsed.data;
+
+        // 2. Scope prevents cross-route or cross-tenant key collisions
         const orgId = req.currentOrganizationUser?.organizationId ?? 'public';
         const userId = req.currentOrganizationUser?.userId ?? 'anon';
         const method = req.method.toUpperCase();
@@ -958,11 +1030,13 @@ export type UserId = Brand<number, 'UserId'>;
 export type OrderId = Brand<number, 'OrderId'>;
 export type Email = Brand<string, 'Email'>;
 
+//? Boundary validation uses Zod's RFC-compliant email parser
+const EmailSchema = z.string().trim().email();
+
 export function parseEmail(raw: unknown): Result<Email, 'INVALID_EMAIL_FORMAT'> {
-    if (typeof raw !== 'string') return fail('INVALID_EMAIL_FORMAT');
-    const trimmed = raw.trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return fail('INVALID_EMAIL_FORMAT');
-    return ok(trimmed as Email);
+    const parsed = EmailSchema.safeParse(raw);
+    if (!parsed.success) return fail('INVALID_EMAIL_FORMAT');
+    return ok(parsed.data.toLowerCase() as Email);
 }
 ```
 

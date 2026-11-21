@@ -1,11 +1,26 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'node:crypto';
+import { z } from 'zod';
 import type { Redis } from 'ioredis';
 
-export interface IdempotencyOptions {
-    ttlSeconds?: number;
-    failClosed?: boolean; ////! Financial transactions must fail-closed if Redis is unavailable
+export interface LoggerInterface {
+    error(message: string, ...meta: unknown[]): void;
+    warn(message: string, ...meta: unknown[]): void;
 }
+
+export interface IdempotencyOptions {
+    readonly ttlSeconds?: number;
+    readonly failClosed?: boolean; //! Financial transactions must fail-closed if Redis is unavailable
+    readonly logger?: LoggerInterface;
+}
+
+//? Zod schema replaces unsafe ad-hoc RegExp
+export const IdempotencyKeySchema = z
+    .string()
+    .trim()
+    .min(16, 'Idempotency key must be at least 16 characters')
+    .max(64, 'Idempotency key must be at most 64 characters')
+    .regex(/^[a-zA-Z0-9_-]+$/, 'Idempotency key must contain only URL-safe alphanumeric, underscore, or hyphen characters');
 
 interface StoredIdempotencyRecord {
     status: 'pending' | 'completed';
@@ -33,25 +48,28 @@ function computePayloadHash(payload: unknown): string {
  * 3. Awaited persistence (guarantees Redis storage before client receives HTTP response)
  * 4. Intercepts both res.json and res.send
  * 5. Configurable fail-closed vs fail-open behavior
+ * 6. Zod-parsed boundary validation
  */
 export function idempotencyMiddleware(redis: Redis, options: IdempotencyOptions = {}) {
-    const { ttlSeconds = 86400, failClosed = true } = options;
+    const { ttlSeconds = 86400, failClosed = true, logger } = options;
 
     return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-        const idempotencyKey = req.header('Idempotency-Key');
-        if (!idempotencyKey) {
+        const rawKey = req.header('Idempotency-Key');
+        if (!rawKey) {
             return next();
         }
 
-        // Validate key format (UUID or alphanumeric 16-64 chars)
-        if (!/^[a-zA-Z0-9_-]{16,64}$/.test(idempotencyKey)) {
+        // 1. Parse and validate idempotency key via Zod
+        const keyParseResult = IdempotencyKeySchema.safeParse(rawKey);
+        if (!keyParseResult.success) {
             res.status(400).json({
                 error: true,
-                message: 'Invalid Idempotency-Key header. Must be 16-64 alphanumeric characters or UUID.',
+                message: keyParseResult.error.errors[0]?.message ?? 'Invalid Idempotency-Key header.',
             });
             return;
         }
 
+        const idempotencyKey = keyParseResult.data;
         const orgId = req.currentOrganizationUser?.organizationId ?? 'public';
         const userId = req.currentOrganizationUser?.userId ?? 'anonymous';
         const method = req.method.toUpperCase();
@@ -124,8 +142,7 @@ export function idempotencyMiddleware(redis: Redis, options: IdempotencyOptions 
                         await redis.del(redisKey);
                     }
                 } catch (persistErr) {
-                    // Log error without blocking response if persistence fails
-                    console.error('[Idempotency] Failed to persist completion state:', persistErr);
+                    logger?.error('[Idempotency] Failed to persist completion state:', persistErr);
                 }
             };
 

@@ -16,11 +16,12 @@
 ## 2. Exponential Backoff with AWS Full Jitter (`withRetry`)
 Retrying failing network operations at fixed intervals or with additive jitter causes the "thundering herd" problem, synchronizing retries and overwhelming recovering downstream servers.
 
-### The Algorithm: Full Jitter
+### The Algorithm: Full Jitter vs Deterministic Backoff
 $$\text{ceiling} = \min(\text{maxDelay}, \text{minDelay} \times \text{factor}^{\text{attempt} - 1})$$
-$$\text{delay} = \text{random}(0, \text{ceiling})$$
+$$\text{delay} = \begin{cases} \text{random}(0, \text{ceiling}) & \text{if } \text{jitter} = \text{true} \\ \text{ceiling} & \text{if } \text{jitter} = \text{false} \end{cases}$$
 
-- **Honoring Upstream Headers**: If an HTTP 429 or 503 response includes a valid `Retry-After` header (in seconds or HTTP-date), the retry mechanism pauses for that exact duration instead of calculating jitter.
+- **Configurable Jitter Toggle (`jitter: boolean`)**: Defaults to `true` (AWS Full Jitter) for production concurrency; can be set to `false` for deterministic unit testing.
+- **Honoring Upstream Headers with Jitter Smoothing**: If an HTTP 429 or 503 response includes a valid `Retry-After` header (in seconds or HTTP-date), the retry mechanism pauses for that duration while adding a small random smoothing jitter (up to 1,000ms) to ensure thousands of concurrent clients do not wake up at the exact same millisecond.
 - **Idempotent 500 Retries**: If the caller explicitly marks the operation as idempotent (`isIdempotent: true`), a single cautious retry is permitted on HTTP 500 Internal Server Error (to handle transient upstream web server restarts).
 - **Transient Errors**: Network drops (`ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `EAI_AGAIN`), HTTP 429, 502, 503, 504, and PostgreSQL deadlocks (`40P01`) / serialization failures (`40001`). These are retried automatically.
 - **Non-Transient Errors**: HTTP 400, 401, 403, 404, 422. These fail fast immediately.

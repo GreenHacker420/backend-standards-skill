@@ -12,17 +12,20 @@ TypeScript uses structural typing. `type UserId = number` and `type OrderId = nu
 
 ```typescript
 declare const __brand: unique symbol;
+import { z } from 'zod';
+
 export type Brand<K, T> = K & { readonly [__brand]: T };
 
 export type UserId = Brand<number, 'UserId'>;
 export type OrderId = Brand<number, 'OrderId'>;
 export type Email = Brand<string, 'Email'>;
 
+const EmailSchema = z.string().trim().email();
+
 export function parseEmail(raw: unknown): Result<Email, 'INVALID_EMAIL'> {
-  if (typeof raw !== 'string') return fail('INVALID_EMAIL');
-  const trimmed = raw.trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return fail('INVALID_EMAIL');
-  return ok(trimmed as Email);
+  const parsed = EmailSchema.safeParse(raw);
+  if (!parsed.success) return fail('INVALID_EMAIL');
+  return ok(parsed.data.toLowerCase() as Email);
 }
 ```
 

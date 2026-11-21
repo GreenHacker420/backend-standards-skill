@@ -311,7 +311,7 @@ Do not introduce patterns that do not solve a demonstrated problem.
 | [controllers](./examples/controllers/) | Single-action controller and request DTO pattern |
 | [database](./examples/database/) | Bulkheaded Prisma pools and an outbox relay example |
 | [modular](./examples/modular/) | A feature-oriented orders module |
-| [observability](./examples/observability/) | Request context, tracing middleware, tail sampler |
+| [observability](./examples/observability/) | Request context, tracing middleware, Zod-parsed W3C trace schemas, tail sampler |
 | [orchestrators](./examples/orchestrators/) | Domain workflow separated from the HTTP layer |
 | [resilience](./examples/resilience/) | Circuit breaker, retries, retry budgets, idempotency, singleflight, degradation |
 | [safety](./examples/safety/) | Timing-safe HMAC comparison, streaming pipelines, advisory locks, cost-weighted rate limiting |

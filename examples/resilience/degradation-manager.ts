@@ -50,7 +50,12 @@ export class DegradationManager {
 
     public setDegradationLevel(level: DegradationLevel, reason: string) {
         if (this.currentLevel !== level) {
-            console.warn(`[Degradation] Shifting from Level ${this.currentLevel} to ${level}. Reason: ${reason}`);
+            //? Structured logging preserves trace context
+            logger.warn('[DegradationManager] Shifting load shedding degradation level', {
+                previousLevel: this.currentLevel,
+                newLevel: level,
+                reason,
+            });
             this.currentLevel = level;
         }
     }

@@ -1,42 +1,52 @@
 import { Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { requestContext, TraceContext } from './request-context';
-
-// W3C Trace Context specification regex (version 00, 32-hex trace-id, 16-hex parent-id, 2-hex flags)
-const W3C_TRACEPARENT_REGEX = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/i;
-const SAFE_ID_REGEX = /^[a-zA-Z0-9_-]{16,64}$/;
+import { W3CTraceparentSchema, SafeCorrelationIdSchema } from './trace-schemas';
 
 /**
- * Validates and extracts trace ID from incoming headers.
- * In production, OpenTelemetry SDK handles this via TextMapPropagator;
- * this lightweight middleware demonstrates standard compliant extraction.
+ * Validates and extracts trace ID from incoming headers using strict Zod schemas.
+ * 
+ * Enforces:
+ * 1. W3C Trace Context spec compliance (55-char length, non-zero trace_id and parent_id)
+ * 2. URL-safe, injection-safe correlation ID boundaries
+ * 3. Graceful cryptographic fallback if incoming telemetry headers are missing or malformed
  */
 function extractValidatedTraceId(req: Request): string {
-    const traceparent = req.header('traceparent');
-    if (traceparent) {
-        const match = W3C_TRACEPARENT_REGEX.exec(traceparent.trim());
-        if (match && match[1] !== '00000000000000000000000000000000') {
-            return match[1].toLowerCase();
+    const rawTraceparent = req.header('traceparent');
+    if (rawTraceparent) {
+        const parseResult = W3CTraceparentSchema.safeParse(rawTraceparent);
+        if (parseResult.success) {
+            return parseResult.data.traceId;
         }
     }
 
-    const customTraceId = req.header('x-trace-id');
-    if (customTraceId && SAFE_ID_REGEX.test(customTraceId.trim())) {
-        return customTraceId.trim();
+    const rawCustomTraceId = req.header('x-trace-id');
+    if (rawCustomTraceId) {
+        const parseResult = SafeCorrelationIdSchema.safeParse(rawCustomTraceId);
+        if (parseResult.success) {
+            return parseResult.data;
+        }
     }
 
-    // Generate compliant 32-hex trace ID (16 bytes random hex)
+    //? Generate standard 32-hex (16-byte) compliant trace identifier
     return uuidv4().replace(/-/g, '').toLowerCase();
+}
+
+function extractValidatedRequestId(req: Request): string {
+    const rawRequestId = req.header('x-request-id');
+    if (rawRequestId) {
+        const parseResult = SafeCorrelationIdSchema.safeParse(rawRequestId);
+        if (parseResult.success) {
+            return parseResult.data;
+        }
+    }
+
+    return uuidv4();
 }
 
 export function tracingMiddleware(req: Request, res: Response, next: NextFunction): void {
     const traceId = extractValidatedTraceId(req);
-    
-    const incomingRequestId = req.header('x-request-id');
-    const requestId = (incomingRequestId && SAFE_ID_REGEX.test(incomingRequestId.trim()))
-        ? incomingRequestId.trim()
-        : uuidv4();
-
+    const requestId = extractValidatedRequestId(req);
     const startTime = Date.now();
 
     const context: TraceContext = {
@@ -45,7 +55,7 @@ export function tracingMiddleware(req: Request, res: Response, next: NextFunctio
         startTime,
     };
 
-    // Standard response headers for correlation
+    //? Echo standard correlation headers in HTTP response
     res.setHeader('x-trace-id', traceId);
     res.setHeader('x-request-id', requestId);
 

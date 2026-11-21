@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { Result, ok, fail } from './result';
 
 /**
@@ -17,11 +18,13 @@ export const asUserId = (id: number): UserId => id as UserId;
 export const asOrderId = (id: number): OrderId => id as OrderId;
 export const asOrgId = (id: number): OrganizationId => id as OrganizationId;
 
+//? Robust RFC-compliant email parsing via Zod
+const EmailSchema = z.string().trim().email();
+
 export function parseEmail(raw: unknown): Result<Email, 'INVALID_EMAIL_FORMAT'> {
-  if (typeof raw !== 'string') return fail('INVALID_EMAIL_FORMAT');
-  const trimmed = raw.trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+  const parseResult = EmailSchema.safeParse(raw);
+  if (!parseResult.success) {
     return fail('INVALID_EMAIL_FORMAT');
   }
-  return ok(trimmed as Email);
+  return ok(parseResult.data.toLowerCase() as Email);
 }
