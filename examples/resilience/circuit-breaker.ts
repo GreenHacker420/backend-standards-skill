@@ -86,7 +86,6 @@ export class CircuitBreaker {
         } catch (err) {
             if (isDesignatedProbe && this.epoch === requestEpoch) {
                 //? Probe failed: immediately trip back to OPEN with full cool-down timeout
-                this.isProbeInFlight = false;
                 this.state = 'OPEN';
                 this.epoch++;
                 this.nextAttemptTime = Date.now() + this.timeoutMs;
@@ -99,6 +98,11 @@ export class CircuitBreaker {
                 }
             }
             throw err;
+        } finally {
+            // Guarantee probe release regardless of resolve, reject, or exception
+            if (isDesignatedProbe && this.epoch === requestEpoch) {
+                this.isProbeInFlight = false;
+            }
         }
     }
 

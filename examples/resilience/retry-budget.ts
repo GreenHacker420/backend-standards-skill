@@ -35,6 +35,19 @@ export class TokenBucketRetryBudget {
     this.minRetriesPerSec = options.minRetriesPerSec ?? 1;
     this.tokens = options.initialTokens ?? 10;
     this.lastDripTime = Date.now();
+
+    if (this.retryRatio < 0 || this.retryRatio > 1) {
+      throw new RangeError('[TokenBucketRetryBudget] retryRatio must be between 0 and 1.');
+    }
+    if (this.maxTokens < 1 || !Number.isFinite(this.maxTokens)) {
+      throw new RangeError('[TokenBucketRetryBudget] maxTokens must be a positive number >= 1.');
+    }
+    if (this.minRetriesPerSec < 0 || !Number.isFinite(this.minRetriesPerSec)) {
+      throw new RangeError('[TokenBucketRetryBudget] minRetriesPerSec must be a non-negative number.');
+    }
+    if (this.tokens < 0 || !Number.isFinite(this.tokens)) {
+      throw new RangeError('[TokenBucketRetryBudget] initialTokens must be a non-negative number.');
+    }
   }
 
   //? Replenish baseline drip tokens over time

@@ -10,11 +10,40 @@ export interface LoggerInterface {
 }
 
 export interface CacheIdempotencyOptions {
-    readonly pendingTtlSeconds?: number;   //? Short lease for in-flight requests (default: 60s) preventing indefinite lockout on crash
-    readonly completedTtlSeconds?: number; //? Retention window for completed responses (default: 86400s / 24h)
-    readonly failClosed?: boolean;         //! If lock cannot be checked at entry, reject with 503 to avoid uncoordinated mutation
+    readonly pendingTtlSeconds?: number;       //? Short lease for in-flight requests (default: 60s) preventing indefinite lockout on crash
+    readonly completedTtlSeconds?: number;     //? Retention window for completed responses (default: 86400s / 24h)
+    readonly disconnectGracePeriodMs?: number; //? Grace window to maintain lease while disconnected handler aborts/rolls back (default: 10000ms)
+    readonly failClosed?: boolean;             //! If lock cannot be checked at entry, reject with 503 to avoid uncoordinated mutation
     readonly sessionValidator?: (token: string) => string | null; //? Validates server-signed session identity for anonymous requests
     readonly logger?: LoggerInterface;
+}
+
+/**
+ * Domain error raised when an idempotency key is reused with a different request payload or parameters.
+ */
+export class IdempotencyConflictError extends Error {
+    constructor(message: string = 'Idempotency conflict: key was previously used with a different request payload or parameters.') {
+        super(message);
+        this.name = 'IdempotencyConflictError';
+    }
+}
+
+/**
+ * Domain error raised when a mutation with the given idempotency key is currently executing.
+ */
+export class IdempotencyInProgressError extends Error {
+    constructor(message: string = 'Mutation with this idempotency key is currently in progress. Please retry shortly.') {
+        super(message);
+        this.name = 'IdempotencyInProgressError';
+    }
+}
+
+/**
+ * Helper to extract the cooperative AbortSignal assigned to the current request.
+ * Downstream database queries, external HTTP calls, and long-running workflows MUST observe this signal.
+ */
+export function getIdempotencySignal(req: Request): AbortSignal | undefined {
+    return (req as unknown as { idempotencyAbortSignal?: AbortSignal }).idempotencyAbortSignal;
 }
 
 //? Zod boundary validation prevents header injection and ReDoS
@@ -134,14 +163,40 @@ end
 /**
  * Fast Cache-Layered Idempotency Middleware (Redis Acceleration)
  * 
- * Note: For authoritative financial transactions (e.g. credit transfers, ledger balance mutations),
- * use the durable PostgreSQL-backed implementation below (executeWithDbIdempotency).
- * Redis is an optional acceleration layer for rapid deduplication, not a substitute for ACID storage.
+ * ============================================================================
+ * Architectural Guarantees & Operational Boundaries
+ * ============================================================================
+ * 1. Mutual Exclusion via Distributed Leases:
+ *    Uses atomic `SET redisKey ownerToken EX pendingTtlSeconds NX` to guarantee that only
+ *    one concurrent caller executes a given (tenantScope, method, route, idempotencyKey).
+ * 2. Active Heartbeat Renewal:
+ *    While the operation is executing, a background heartbeat extends the lease every
+ *    pendingTtlSeconds / 3 up to a hard ceiling (maxHoldTimeoutMs = 120s).
+ * 3. Enforceable Cooperative Cancellation:
+ *    Exposes `req.idempotencyAbortSignal` (accessible via `getIdempotencySignal(req)`).
+ *    If lease health is lost, heartbeat fails, or client disconnects, `abortController.abort()`
+ *    is dispatched immediately so downstream Prisma queries, fetch requests, and workers halt.
+ * 4. Stale Mutation Protection on Client Disconnect:
+ *    When a client aborts (!res.writableEnded), the middleware dispatches AbortSignal but
+ *    maintains lease renewal for `disconnectGracePeriodMs` (default: 10s) before halting.
+ *    This prevents a concurrent client retry from acquiring the key while the previous handler's
+ *    database transaction is still in the middle of rolling back.
+ * 5. Replay Allowlisting:
+ *    Only safe, deterministic response headers (Location, Content-Type, Content-Language, X-Request-Id)
+ *    are replayed. Dynamic security headers (Set-Cookie, Date) are never replayed.
+ * 
+ * Operational Boundary / Non-Guarantee:
+ * - Redis is an application-layer acceleration and rate-mitigation mechanism, NOT an ACID store.
+ * - If Node crashes (SIGKILL) or an un-instrumented handler ignores AbortSignal, Redis cannot
+ *   guarantee rollback.
+ * - For authoritative financial transactions (e.g. ledger mutations, payments, credit balances),
+ *   the PostgreSQL durable implementation (`executeWithDbIdempotency`) is MANDATORY.
  */
 export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempotencyOptions = {}) {
     const {
-        pendingTtlSeconds = 60,       // Short lease for pending execution (prevents 24h lockout on crash)
-        completedTtlSeconds = 86400,  // Full 24h retention for completed responses
+        pendingTtlSeconds = 60,            // Short lease for pending execution (prevents 24h lockout on crash)
+        completedTtlSeconds = 86400,       // Full 24h retention for completed responses
+        disconnectGracePeriodMs = 10000,   // Grace period (10s) to hold lease during client disconnect rollback
         failClosed = true,
         sessionValidator,
         logger,
@@ -393,10 +448,10 @@ export function cacheIdempotencyMiddleware(redis: Redis, options: CacheIdempoten
                         ownerToken,
                     });
 
-                    // Allow a 5-second graceful abort/rollback window before terminating heartbeat
+                    // Maintain lease renewal during disconnectGracePeriodMs so database rollback can settle before another request can claim the key
                     disconnectGraceTimer = setTimeout(() => {
                         stopHeartbeat();
-                    }, 5000);
+                    }, disconnectGracePeriodMs);
                     disconnectGraceTimer.unref();
                 } else {
                     stopHeartbeat();
@@ -668,7 +723,7 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
 
             const existing = rows[0];
             if (!existing) {
-                throw new Error('Concurrent idempotency race: record not found after conflict.');
+                throw new IdempotencyConflictError('Concurrent idempotency race: record not found after conflict resolution.');
             }
 
             // Expiration Enforcement via PostgreSQL clock_timestamp()
@@ -689,7 +744,7 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
                 `;
             } else {
                 if (existing.request_fingerprint !== requestFingerprint) {
-                    throw new Error('Idempotency conflict: key was previously used with a different request payload.');
+                    throw new IdempotencyConflictError('Idempotency conflict: key was previously used with a different request payload or parameters.');
                 }
 
                 if (existing.status === 'COMPLETED' && typeof existing.http_code === 'number') {
@@ -702,7 +757,25 @@ export async function executeWithDbIdempotency<TResult, TTx extends DbRawTransac
                 }
 
                 if (existing.status === 'PENDING') {
-                    throw new Error('Mutation with this idempotency key is currently in progress.');
+                    throw new IdempotencyInProgressError('Mutation with this idempotency key is currently in progress. Please retry shortly.');
+                }
+
+                if (existing.status === 'FAILED') {
+                    // Previous attempt failed or was marked FAILED; reclaim the record into PENDING for this retry
+                    await tx.$executeRaw`
+                        UPDATE idempotency_records
+                        SET status = 'PENDING',
+                            request_fingerprint = ${requestFingerprint},
+                            http_code = NULL,
+                            response_headers = NULL,
+                            response_body = NULL,
+                            expires_at = clock_timestamp() + (${`${ttlMinutes} minutes`})::INTERVAL,
+                            created_at = clock_timestamp()
+                        WHERE organization_id = ${organizationId}
+                          AND user_id = ${normalizedUserId}
+                          AND scope = ${scope}
+                          AND idempotency_key = ${idempotencyKey};
+                    `;
                 }
             }
         }
