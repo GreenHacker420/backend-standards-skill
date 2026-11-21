@@ -603,14 +603,16 @@ export function isTransientError(error: unknown, attempt: number, isIdempotent =
         if (status !== undefined && status >= 400 && status < 500) return false;
     }
 
-    // Node.js network connection drops
+    // Node.js network connection drops, Undici socket timeouts & Prisma transient codes
     if ('code' in error) {
         const code = (error as { code?: string }).code;
-        if (code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || code === 'EAI_AGAIN') {
-            return true;
-        }
-        // Postgres Deadlocks (40P01) and Serialization Failures (40001)
-        if (code === '40P01' || code === '40001') return true;
+        const transientCodes = new Set([
+            'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNABORTED', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE',
+            'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+            'P1001', 'P1002', 'P1017', 'P2024', 'P2034', // Prisma DB connection drops, pool timeouts & conflict
+            '40P01', '40001',                             // PostgreSQL Deadlocks and Serialization Failures
+        ]);
+        if (code && transientCodes.has(code)) return true;
     }
 
     return false;

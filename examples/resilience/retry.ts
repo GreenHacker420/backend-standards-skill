@@ -72,14 +72,32 @@ export function isTransientError(error: unknown, attempt: number, isIdempotent =
         }
     }
 
-    // Node.js network connection drops
+    // Node.js network connection drops, Undici socket timeouts & Prisma transient codes
     if (err.code) {
-        const transientCodes = new Set(['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'EPIPE']);
+        const transientCodes = new Set([
+            // Node / OS Network Drops
+            'ECONNRESET',
+            'ETIMEDOUT',
+            'ECONNREFUSED',
+            'ECONNABORTED',
+            'EAI_AGAIN',
+            'ENOTFOUND',
+            'EPIPE',
+            // Undici / Native Fetch Socket Errors
+            'UND_ERR_SOCKET',
+            'UND_ERR_CONNECT_TIMEOUT',
+            'UND_ERR_HEADERS_TIMEOUT',
+            // Prisma Connection Loss, Pool Timeout & Transaction Conflicts
+            'P1001', // Can't reach database server
+            'P1002', // Database server timed out
+            'P1017', // Server closed the connection
+            'P2024', // Timed out fetching a new connection from the pool
+            'P2034', // Transaction failed due to a write conflict or deadlock
+            // PostgreSQL SQLSTATE Deadlocks & Serialization Failures
+            '40P01', // Deadlock detected
+            '40001', // Serialization failure
+        ]);
         if (transientCodes.has(err.code)) {
-            return true;
-        }
-        // PostgreSQL transaction deadlocks (40P01) or serialization failures (40001)
-        if (err.code === '40P01' || err.code === '40001') {
             return true;
         }
     }
